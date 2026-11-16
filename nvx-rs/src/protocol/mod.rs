@@ -1,0 +1,211 @@
+//! The wire formats and boot tokens that the host and the guest share.
+//!
+//! OpenVMM brokers an authenticated stream of records (magic `NVXS`) between one host client and
+//! the guest's agent. Data records carry the bytes of an application protocol, which the host and
+//! its guest choose. The records, their session, and NVX's own application protocol are private
+//! to this crate: a program speaks its protocol over the bytes of the VM's control connection, the
+//! host's `nvx::host::vm::Connection` (feature `host`) and the guest's
+//! `nvx::guest::control::Connection` (feature `guest`, Linux). All integers are little-endian.
+//!
+//! - `MAPS` payloads: the [`HostMap`] table that the host encodes with [`encode_maps_payloads`],
+//!   and the [`MapsPayload`] that the guest agent decodes with [`decode_maps_payload`].
+//! - The kernel command-line tokens through which the host configures the guest agent at boot,
+//!   such as [`MAPS_TOKEN`].
+//! - [`cmdline`]: the kernel command line as Linux reads it, for the readers that need the
+//!   kernel's view of it: the parameters into which the kernel splits it, and the virtio-mmio
+//!   devices, of any type, that its `virtio_mmio.device` parameters describe; and the guest's DNS
+//!   server, which OpenVMM's `virtnet_dns=` token names, with the resolver file that names it.
+//! - [`root`]: the boot tokens of a layered root, which name its image's format and identity and
+//!   its upper, with the host's renderer and the guest's parser.
+//! - [`view`]: a cold boot's hostname bytes and machine-ID mode, with their renderer and parser.
+//! - [`export`]: the boot tokens of the host export, the aggregate virtio-fs device from which a
+//!   guest maps host paths, and the guest's strict parser of them.
+//! - [`share`]: the guest targets that a sandbox's live shares may not take, which the host and
+//!   the guest both refuse.
+//! - [`status`]: the exit statuses with which a clone's guest ends its VM once its repair or its
+//!   guest restore failed, the time ABI's included, from which the host classifies a clone's end.
+//!
+//! The module depends on nothing outside the standard library, so the host, the guest, and test
+//! doubles share it. Tests pin its wire constants and frames as literals, and its records and
+//! payloads with the conformance vectors of the crate's `tests/vectors/`, whose bytes no codec
+//! produced.
+
+use std::fmt;
+
+mod app;
+mod boot;
+pub mod cmdline;
+#[cfg(any(
+    feature = "cli",
+    feature = "testing",
+    all(feature = "guest", target_os = "linux", target_arch = "x86_64")
+))]
+pub(crate) mod exec;
+pub mod export;
+pub mod maps;
+#[cfg_attr(
+    not(all(
+        feature = "host",
+        feature = "testing",
+        feature = "guest",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the host, the fake OpenVMM, and the guest each use part of NVXS"
+    )
+)]
+pub(crate) mod nvxs;
+#[cfg_attr(
+    not(all(
+        feature = "host",
+        feature = "testing",
+        feature = "guest",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )),
+    allow(
+        dead_code,
+        reason = "the host, the fake OpenVMM, and the guest each use part of NVXS"
+    )
+)]
+mod outer;
+pub mod restore_ready;
+pub mod root;
+pub mod share;
+pub mod status;
+#[cfg(test)]
+mod tests;
+pub mod view;
+
+#[cfg(all(feature = "guest", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use app::APP_ACTIVATE;
+#[cfg(all(feature = "guest", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use app::APP_CAPTURE;
+#[cfg(all(feature = "guest", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use app::APP_EXIT;
+#[cfg(any(
+    feature = "cli",
+    feature = "testing",
+    all(feature = "guest", target_os = "linux", target_arch = "x86_64")
+))]
+pub(crate) use app::APP_HEADER_LEN;
+#[cfg(all(feature = "guest", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use app::AppFrame;
+#[cfg(any(
+    feature = "cli",
+    feature = "testing",
+    all(feature = "guest", target_os = "linux", target_arch = "x86_64")
+))]
+pub(crate) use app::MAPPING_FAILED;
+#[cfg(feature = "cli")]
+pub(crate) use app::encode_activate_payload;
+#[cfg(feature = "cli")]
+pub(crate) use app::encode_capture_payload;
+#[cfg(any(
+    feature = "cli",
+    feature = "testing",
+    all(feature = "guest", target_os = "linux", target_arch = "x86_64")
+))]
+pub(crate) use app::v2;
+#[cfg(any(
+    feature = "cli",
+    all(feature = "guest", target_os = "linux", target_arch = "x86_64")
+))]
+pub(crate) use app::workload;
+#[cfg(any(
+    feature = "testing",
+    all(feature = "guest", target_os = "linux", target_arch = "x86_64")
+))]
+pub(crate) use app::{
+    APP_CANCEL, APP_ERROR, APP_EXEC, APP_MAPS, APP_PING, APP_READY, APP_STDERR, APP_STDOUT,
+    APP_STOP, APP_STOPPED, UNSUPPORTED_OPERATION,
+};
+#[cfg(any(
+    feature = "testing",
+    all(feature = "guest", target_os = "linux", target_arch = "x86_64")
+))]
+pub(crate) use app::{BUSY, CWD_FAILED, INVALID_REQUEST, LAUNCH_FAILED, MAPPINGS_INCOMPLETE};
+#[cfg(all(feature = "guest", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use app::{decode_activate_payload, decode_capture_payload};
+pub use boot::{MAPS_TOKEN, parse_host_mapping_count};
+#[cfg(feature = "testing")]
+pub(crate) use exec::decode_exec_payload;
+#[cfg(all(feature = "guest", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use exec::{GuestExecPayload, decode_guest_exec_payload};
+#[cfg(feature = "cli")]
+pub(crate) use exec::{Workload, WorkloadEnvironment, encode_exec_payload};
+pub use maps::{
+    GuestHostMap, GuestMapsPayload, HostMap, MAP_ENTRY_HEADER_LEN, MAP_READ_ONLY, MAPS_HEADER_LEN,
+    MAX_HOST_MAPPINGS, MAX_MAP_PATH_BYTES, MapsPayload, decode_guest_maps_payload,
+    decode_maps_payload, encode_maps_payloads,
+};
+#[cfg_attr(
+    not(all(
+        feature = "host",
+        feature = "testing",
+        feature = "guest",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )),
+    allow(
+        unused_imports,
+        reason = "the host, the fake OpenVMM, and the guest each use part of NVXS"
+    )
+)]
+pub(crate) use outer::{
+    CAPABILITY_LEN, OUTER_ACK, OUTER_CREDIT, OUTER_DATA, OUTER_ERROR, OUTER_GUEST_ATTACH,
+    OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_MAGIC, OUTER_MAX_PAYLOAD, OUTER_MAX_RECEIVE_WINDOW,
+    OUTER_MIN_RECEIVE_WINDOW, OUTER_READY, OUTER_RECEIVE_WINDOW, OUTER_RESET, OUTER_VERSION,
+    OUTER_WAIT, OuterHeader, decode_outer_header, encode_outer,
+};
+
+/// Protocol violation detected while encoding or decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolError(String);
+
+impl ProtocolError {
+    /// Returns the description of the violation.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the description of the violation, consuming the error.
+    pub fn into_message(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
+/// Constructs a protocol error whose message describes the violated wire contract.
+fn violation(message: impl Into<String>) -> ProtocolError {
+    ProtocolError(message.into())
+}
+
+/// Copies an exactly `N`-byte wire field into an array for integer decoding.
+fn array<const N: usize>(bytes: &[u8]) -> [u8; N] {
+    let mut output = [0u8; N];
+    output.copy_from_slice(bytes);
+    output
+}
+
+/// Reads the little-endian `u16` at `offset`, or `None` past the end of `bytes`.
+fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+    let field = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_le_bytes(array(field)))
+}
+
+/// Reads the little-endian `u32` at `offset`, or `None` past the end of `bytes`.
+fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    let field = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes(array(field)))
+}

@@ -1,0 +1,2231 @@
+use std::ffi::CString;
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::thread;
+
+use crate::protocol::{
+    APP_ERROR, APP_EXIT, APP_HEADER_LEN, APP_STDERR, APP_STDOUT, OUTER_ACK, OUTER_CREDIT,
+    OUTER_DATA, OUTER_GUEST_ATTACH, OUTER_HEADER_LEN, OUTER_MAX_PAYLOAD, OUTER_RECEIVE_WINDOW,
+    OUTER_RESET, OUTER_WAIT, OuterHeader, ProtocolError, Workload, WorkloadEnvironment,
+    decode_outer_header, encode_exec_payload, encode_outer, v2,
+};
+
+use super::super::seam::Paths;
+use super::super::seam::tests::{TestSystem, attach_calls};
+use super::*;
+use crate::guest::init::Capture;
+use crate::guest::mappings::Access;
+use crate::guest::sys::tests::{
+    CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_SETGID, CAP_SETUID, holds_capability,
+};
+use crate::guest::sys::{self, FileDescriptor};
+
+const INSTANCE: [u8; 16] = [7; 16];
+/// The kind of `BUSY`, with which the agent refuses a request while an execution runs.
+const APP_BUSY: u8 = 0x87;
+
+/// A frame that the agent sent: its kind, request ID and status, and its payload, which follows
+/// a `READY`'s protocol version.
+#[derive(Debug, PartialEq, Eq)]
+struct Response {
+    kind: u8,
+    request_id: u64,
+    status: i32,
+    payload: Vec<u8>,
+}
+
+struct Harness {
+    host: UnixStream,
+    thread: thread::JoinHandle<(Result<Outcome, Errno>, TestSystem)>,
+    epoch: u64,
+    host_sequence: u64,
+    guest_sequence: u64,
+}
+
+impl Harness {
+    fn new() -> Self {
+        Self::with_system(TestSystem::new(Paths::default()), 0)
+    }
+
+    fn with_system(system: TestSystem, expected_mappings: u32) -> Self {
+        let mut harness = Self::spawn(system, expected_mappings);
+        harness.reset(1, 7);
+        harness
+    }
+
+    /// Starts the agent, with a table of `expected_mappings` announced mappings, which attaches
+    /// and waits for the broker's first RESET.
+    fn spawn(system: TestSystem, expected_mappings: u32) -> Self {
+        let config = AgentConfig::for_test();
+        let mappings = HostMappings::announced(expected_mappings);
+        Self::spawn_with(system, config, mappings)
+    }
+
+    fn spawn_with(system: TestSystem, config: AgentConfig, mappings: HostMappings) -> Self {
+        Self::spawn_with_capture(system, config, mappings, None)
+    }
+
+    fn spawn_with_capture(
+        mut system: TestSystem,
+        config: AgentConfig,
+        mut mappings: HostMappings,
+        capture: Option<Capture>,
+    ) -> Self {
+        let (host, guest) = UnixStream::pair().unwrap();
+        let descriptor = FileDescriptor::from_owned(guest.into());
+        let thread = thread::spawn(move || {
+            let mut session = Session::new(descriptor);
+            if let Some(capture) = capture {
+                session = session.with_capture(capture);
+            }
+            let outcome = run(&mut system, &mut session, &config, &mut mappings);
+            (outcome, system)
+        });
+        let mut harness = Self {
+            host,
+            thread,
+            epoch: 0,
+            host_sequence: 0,
+            guest_sequence: 0,
+        };
+        let (header, payload) = harness.read_outer();
+        assert_eq!(header.record_type, OUTER_GUEST_ATTACH);
+        assert!(payload.is_empty());
+        harness
+    }
+
+    /// Resets the session to `epoch` with a RESET at `sequence`, which the agent acknowledges.
+    fn reset(&mut self, epoch: u64, sequence: u64) {
+        self.host
+            .write_all(&encode_outer(OUTER_RESET, &INSTANCE, epoch, sequence, &[]).unwrap())
+            .unwrap();
+        let (header, payload) = self.read_outer();
+        assert_eq!(
+            (header.record_type, header.epoch, header.sequence),
+            (OUTER_ACK, epoch, 0)
+        );
+        assert_eq!(payload, OUTER_RECEIVE_WINDOW.to_le_bytes());
+        self.epoch = epoch;
+        self.host_sequence = sequence + 1;
+        self.guest_sequence = 1;
+    }
+
+    fn request(&mut self, kind: u8, payload: &[u8]) -> Response {
+        let mut responses = self.request_all(42, kind, payload);
+        assert_eq!(responses.len(), 1, "{responses:?}");
+        responses.pop().unwrap()
+    }
+
+    fn request_all(&mut self, request_id: u64, kind: u8, payload: &[u8]) -> Vec<Response> {
+        self.send(request_id, kind, payload);
+        self.responses()
+    }
+
+    /// Sends one request, of version 2, and reads the credit that returns its bytes, before any
+    /// response.
+    fn send(&mut self, request_id: u64, kind: u8, payload: &[u8]) {
+        let frame = frame(kind, request_id, payload);
+        self.host
+            .write_all(
+                &encode_outer(
+                    OUTER_DATA,
+                    &INSTANCE,
+                    self.epoch,
+                    self.host_sequence,
+                    &frame,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        self.host_sequence += 1;
+        let (credit, payload) = self.read_outer();
+        assert_eq!(
+            (credit.record_type, credit.epoch, credit.sequence),
+            (OUTER_CREDIT, self.epoch, self.guest_sequence)
+        );
+        assert_eq!(payload, (frame.len() as u32).to_le_bytes());
+        self.guest_sequence += 1;
+    }
+
+    /// Reads the next response, terminal or not.
+    fn next_response(&mut self) -> Response {
+        let (data, frame) = self.read_outer();
+        assert_eq!(
+            (data.record_type, data.sequence),
+            (OUTER_DATA, self.guest_sequence)
+        );
+        self.guest_sequence += 1;
+        response_of(&frame)
+    }
+
+    /// Reads responses up to the first terminal one, which it returns last.
+    fn responses(&mut self) -> Vec<Response> {
+        let mut responses = Vec::new();
+        loop {
+            let response = self.next_response();
+            let terminal = matches!(
+                response.kind,
+                APP_READY | APP_ERROR | APP_EXIT | APP_STOPPED | APP_BUSY
+            );
+            responses.push(response);
+            if terminal {
+                return responses;
+            }
+        }
+    }
+
+    fn stop(mut self) -> TestSystem {
+        let response = self.request(APP_STOP, &[]);
+        assert_eq!(
+            (
+                response.kind,
+                response.request_id,
+                response.status,
+                response.payload.as_slice()
+            ),
+            (APP_STOPPED, 42, 0, b"".as_slice())
+        );
+        let (outcome, system) = self.thread.join().unwrap();
+        assert!(matches!(outcome, Ok(Outcome::Stopped)));
+        system
+    }
+
+    fn fail(mut self, record: &[u8]) -> Vec<u8> {
+        self.host.write_all(record).unwrap();
+        let (outcome, system) = self.thread.join().unwrap();
+        assert!(outcome.is_err());
+        system.diagnostics
+    }
+
+    /// Ends the stream after `partial`, a part of a record or nothing.
+    fn close(mut self, partial: &[u8]) -> Vec<u8> {
+        self.host.write_all(partial).unwrap();
+        self.host.shutdown(std::net::Shutdown::Write).unwrap();
+        let (outcome, system) = self.thread.join().unwrap();
+        assert_eq!(outcome.err(), Some(Errno::EIO));
+        system.diagnostics
+    }
+
+    fn read_outer(&mut self) -> (OuterHeader, Vec<u8>) {
+        read_outer(&mut self.host)
+    }
+}
+
+fn read_outer(host: &mut UnixStream) -> (OuterHeader, Vec<u8>) {
+    let mut header = [0u8; OUTER_HEADER_LEN];
+    host.read_exact(&mut header).unwrap();
+    let header = decode_outer_header(&header).unwrap();
+    let mut payload = vec![0; header.length];
+    host.read_exact(&mut payload).unwrap();
+    (header, payload)
+}
+
+mod runtime;
+mod streams;
+
+/// Returns the request of version 2 of `kind`, with `request_id`, status 0 and `payload`, as the
+/// protocol defines it, whatever the payload that the kind allows.
+fn frame(kind: u8, request_id: u64, payload: &[u8]) -> Vec<u8> {
+    let length = u32::try_from(payload.len()).unwrap();
+    [
+        &b"NVXC\x02"[..],
+        &[kind, 0, 0],
+        &request_id.to_le_bytes(),
+        &0i32.to_le_bytes(),
+        &length.to_le_bytes(),
+        payload,
+    ]
+    .concat()
+}
+
+/// Returns the response that `frame`, of version 2, carries.
+fn response_of(frame: &[u8]) -> Response {
+    let (request_id, decoded) = v2::Frame::decode(frame).unwrap();
+    let mut payload = &frame[APP_HEADER_LEN..];
+    if let v2::Frame::Ready {
+        version,
+        activation,
+    } = decoded
+    {
+        assert_eq!(version, v2::VERSION);
+        payload = activation;
+    }
+    Response {
+        kind: frame[5],
+        request_id,
+        status: i32::from_le_bytes(frame[16..20].try_into().unwrap()),
+        payload: payload.to_vec(),
+    }
+}
+
+fn response(kind: u8, request_id: u64, status: i32, payload: &[u8]) -> Response {
+    Response {
+        kind,
+        request_id,
+        status,
+        payload: payload.to_vec(),
+    }
+}
+
+fn stdout_from(mut replies: Vec<Response>, request_id: u64, status: i32) -> Vec<u8> {
+    assert_eq!(
+        replies.pop(),
+        Some(response(APP_EXIT, request_id, status, b"exit"))
+    );
+    assert!(replies.iter().all(|reply| {
+        reply.kind == APP_STDOUT && reply.request_id == request_id && reply.status == 0
+    }));
+    replies
+        .into_iter()
+        .flat_map(|reply| reply.payload)
+        .collect()
+}
+
+fn exec_payload(cwd: Option<&str>) -> Vec<u8> {
+    encode_exec_payload(&Workload {
+        argv: vec!["/bin/true".to_owned()],
+        timeout_ms: 0,
+        cwd,
+        environment: WorkloadEnvironment::Default,
+    })
+    .unwrap()
+}
+
+fn maps_payload(first: u32, entries: &[(&[u8], &[u8], u16)], count: Option<u32>) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&first.to_le_bytes());
+    payload.extend_from_slice(&count.unwrap_or(entries.len() as u32).to_le_bytes());
+    for (source, target, flags) in entries {
+        payload.extend_from_slice(&flags.to_le_bytes());
+        payload.extend_from_slice(&(source.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&(target.len() as u16).to_le_bytes());
+        payload.extend_from_slice(source);
+        payload.extend_from_slice(target);
+    }
+    payload
+}
+
+fn assert_environment_failure(mut harness: Harness, diagnostic_prefix: &[u8]) {
+    let replies = harness.request_all(42, APP_EXEC, &exec_payload(None));
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert_eq!(
+        (replies[0].kind, replies[0].request_id, replies[0].status),
+        (APP_STDERR, 42, 0)
+    );
+    assert!(
+        replies[0].payload.starts_with(diagnostic_prefix),
+        "{:?}",
+        replies[0].payload
+    );
+    assert_eq!(replies[1], response(APP_EXIT, 42, 125, b"exit"));
+    let system = harness.stop();
+    assert_eq!(system.spawn_calls, 0);
+}
+
+#[test]
+fn fresh_session_refuses_root_requests_and_routes_capture_before_stopping() {
+    let config = AgentConfig::for_test();
+    let mappings = HostMappings::announced(0);
+    let mut harness = Harness::spawn_with_capture(
+        TestSystem::new(Paths::default()),
+        config,
+        mappings,
+        Some(Capture::fixture(true)),
+    );
+    harness.reset(1, 7);
+    for (kind, payload) in [
+        (APP_EXEC, exec_payload(None)),
+        (APP_MAPS, maps_payload(0, &[], None)),
+        (APP_PING, Vec::new()),
+    ] {
+        assert_eq!(
+            harness.request(kind, &payload),
+            response(
+                APP_ERROR,
+                42,
+                Errno::ENOTSUP as i32,
+                b"unsupported-operation"
+            )
+        );
+    }
+    assert_eq!(
+        harness.request(APP_CAPTURE, &[0]),
+        response(APP_ERROR, 42, Errno::EPERM as i32, b"capture-failed")
+    );
+    harness.host.set_nonblocking(true).unwrap();
+    assert_eq!(
+        harness.host.read(&mut [0]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    harness.host.set_nonblocking(false).unwrap();
+    let system = harness.stop();
+    assert_eq!(system.spawn_calls, 0);
+    assert!(system.kernel.calls().is_empty());
+    assert!(system.diagnostics.is_empty());
+}
+
+#[test]
+fn agent_refuses_unannounced_mapping_tables() {
+    let mut harness = Harness::new();
+    let response = harness.request(APP_MAPS, b"\0\0\0\0\x01\0\0\0\0\0\x01\0\x02\0");
+    assert_eq!(
+        (response.kind, response.request_id, response.status),
+        (APP_ERROR, 42, Errno::EINVAL as i32)
+    );
+    assert_eq!(response.payload, INVALID_REQUEST.as_bytes());
+    harness.stop();
+}
+
+#[test]
+fn mappings_mount_in_order_and_unblock_workloads_through_dispatch() {
+    let (temporary, system) = TestSystem::with_host_export();
+    let export = system.paths.hostfs_dir.join("root").canonicalize().unwrap();
+    let guest = temporary.path().canonicalize().unwrap().join("guest");
+    let source = guest.join("src");
+    let notes = guest.join("notes.txt");
+    let out = guest.join("out");
+    let first = maps_payload(
+        0,
+        &[
+            (
+                b"0/src",
+                source.as_os_str().as_bytes(),
+                protocol::MAP_READ_ONLY,
+            ),
+            (b"0/notes.txt", notes.as_os_str().as_bytes(), 0),
+        ],
+        None,
+    );
+    let second = maps_payload(2, &[(b"1", out.as_os_str().as_bytes(), 0)], None);
+    let mut harness = Harness::with_system(system, 3);
+    let mut replies = Vec::new();
+    replies.extend(harness.request_all(1, APP_EXEC, &[]));
+    replies.extend(harness.request_all(2, APP_MAPS, &first));
+    replies.extend(harness.request_all(3, APP_EXEC, &[]));
+    replies.extend(harness.request_all(4, APP_MAPS, &second));
+    replies.extend(harness.request_all(5, APP_EXEC, &[]));
+    assert_eq!(
+        replies,
+        vec![
+            response(APP_ERROR, 1, Errno::EAGAIN as i32, b"mappings-incomplete"),
+            response(APP_READY, 2, 0, b""),
+            response(APP_ERROR, 3, Errno::EAGAIN as i32, b"mappings-incomplete"),
+            response(APP_READY, 4, 0, b""),
+            response(APP_ERROR, 5, Errno::EINVAL as i32, b"invalid-request"),
+        ]
+    );
+
+    let system = harness.stop();
+    let expected: Vec<_> = [
+        (export.join("0/src"), &source, Access::ReadOnly),
+        (export.join("0/notes.txt"), &notes, Access::ReadWrite),
+        (export.join("1"), &out, Access::ReadWrite),
+    ]
+    .into_iter()
+    .flat_map(|(from, to, access)| attach_calls(&from, to, access))
+    .collect();
+    assert_eq!(system.kernel.calls(), expected);
+    assert!(source.is_dir());
+    assert!(notes.is_file());
+    assert!(out.is_dir());
+    assert_eq!(system.spawn_calls, 0);
+}
+
+#[test]
+fn init_refuses_activation_without_a_restore_and_keeps_serving() {
+    for fresh in [true, false] {
+        let config = AgentConfig::for_test();
+        let mut mappings = HostMappings::announced(0);
+        let mut system = TestSystem::new(Paths::default());
+        let (host, guest) = UnixStream::pair().unwrap();
+        let thread = thread::spawn(move || {
+            let mut session = Session::new(FileDescriptor::from_owned(guest.into()))
+                .with_capture(crate::guest::init::Capture::fixture(fresh));
+            let outcome = run(&mut system, &mut session, &config, &mut mappings);
+            (outcome, system)
+        });
+        let mut harness = Harness {
+            host,
+            thread,
+            epoch: 0,
+            host_sequence: 0,
+            guest_sequence: 0,
+        };
+        assert_eq!(harness.read_outer().0.record_type, OUTER_GUEST_ATTACH);
+        for epoch in [1, 2] {
+            harness.reset(epoch, 7);
+            assert_eq!(
+                harness.request(APP_ACTIVATE, b"misrouted"),
+                response(
+                    APP_ERROR,
+                    42,
+                    Errno::ENOTSUP as i32,
+                    b"unsupported-operation"
+                )
+            );
+        }
+        if !fresh {
+            assert_eq!(
+                harness.request(APP_PING, &[]),
+                response(APP_READY, 42, 0, b"")
+            );
+        }
+        let system = harness.stop();
+        assert!(system.diagnostics.is_empty());
+        assert_eq!(system.spawn_calls, 0);
+    }
+}
+
+#[test]
+fn restored_ready_maps_and_first_exec_share_the_existing_start_transition() -> TestResult {
+    use crate::guest::init::Capture;
+    use crate::guest::restore::{GuestRestoreAction, GuestRestoreState};
+    if super::super::tests::isolate_process_test(
+        "NVX_RESTORED_DISPATCH_TEST",
+        "guest::managed_agent::dispatch::tests::restored_ready_maps_and_first_exec_share_the_existing_start_transition",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut system) = TestSystem::with_host_export();
+    system.direct_starter = Some(super::super::seam::tests::start_as_privileged);
+    let target = temporary.path().canonicalize()?.join("guest");
+    let first = maps_payload(
+        0,
+        &[(b"0/src", target.join("src").as_os_str().as_bytes(), 0)],
+        None,
+    );
+    let second = maps_payload(
+        1,
+        &[(b"1", target.join("out").as_os_str().as_bytes(), 0)],
+        None,
+    );
+    let config = AgentConfig::for_test();
+    let mut mappings = HostMappings::announced(2);
+    let (mut capture, payload) = Capture::activation_fixture();
+    let activation = capture.restored.as_mut().unwrap();
+    assert!(matches!(
+        activation.accept(&payload, std::time::Instant::now())?.0,
+        GuestRestoreAction::Apply(_)
+    ));
+    let ready = activation
+        .activation
+        .complete(std::time::Instant::now(), Ok(()))?
+        .encode();
+    let (host, guest) = UnixStream::pair()?;
+    let thread = thread::spawn(move || {
+        let mut session =
+            Session::new(FileDescriptor::from_owned(guest.into())).with_capture(capture);
+        let outcome = run(&mut system, &mut session, &config, &mut mappings);
+        assert_eq!(
+            session.activation_state_for_test(),
+            Some(GuestRestoreState::Started)
+        );
+        (outcome, system)
+    });
+    let mut harness = Harness {
+        host,
+        thread,
+        epoch: 0,
+        host_sequence: 0,
+        guest_sequence: 0,
+    };
+    assert_eq!(harness.read_outer().0.record_type, OUTER_GUEST_ATTACH);
+    harness.reset(1, 7);
+    assert_eq!(
+        harness.request(APP_ACTIVATE, &payload),
+        response(APP_READY, 42, 0, &ready)
+    );
+    let execution = workload_payload(&["/bin/sh", "-c", "printf restored"], None)?;
+    for maps in [&first, &second] {
+        assert_eq!(
+            harness.request(APP_EXEC, &execution),
+            response(APP_ERROR, 42, Errno::EAGAIN as i32, b"mappings-incomplete"),
+        );
+        assert_eq!(
+            harness.request(APP_MAPS, maps),
+            response(APP_READY, 42, 0, b"")
+        );
+    }
+    assert_eq!(
+        stdout_from(harness.request_all(43, APP_EXEC, &execution), 43, 0),
+        b"restored"
+    );
+    harness.reset(2, 4);
+    assert_eq!(
+        harness.request(APP_ACTIVATE, &payload),
+        response(APP_READY, 42, 0, &ready)
+    );
+    assert_eq!(
+        stdout_from(harness.request_all(44, APP_EXEC, &execution), 44, 0),
+        b"restored"
+    );
+    let system = harness.stop();
+    assert!(system.diagnostics.is_empty());
+    assert_eq!(system.kernel.moves().len(), 2);
+    Ok(())
+}
+
+/// Starts a restored agent whose activation is ready, activates it with the request that it
+/// accepted, and starts a workload that runs until it is cancelled. Returns the harness, that
+/// request, what Ready reports, and the workload's process.
+fn running_restored_workload(system: TestSystem) -> (Harness, Vec<u8>, Vec<u8>, sys::ProcessId) {
+    use crate::guest::restore::GuestRestoreAction;
+    let config = AgentConfig::for_test();
+    let mappings = HostMappings::announced(0);
+    let (mut capture, payload) = Capture::activation_fixture();
+    let restored = capture.restored.as_mut().unwrap();
+    let now = std::time::Instant::now();
+    assert!(matches!(
+        restored.accept(&payload, now).unwrap().0,
+        GuestRestoreAction::Apply(_)
+    ));
+    let ready = restored.activation.complete(now, Ok(())).unwrap().encode();
+    let mut harness = Harness::spawn_with_capture(system, config, mappings, Some(capture));
+    harness.reset(1, 7);
+    assert_eq!(
+        harness.request(APP_ACTIVATE, &payload),
+        response(APP_READY, 42, 0, &ready)
+    );
+    let execution = workload_payload(&["/bin/sh", "-c", "echo $$; exec sleep 30"], None).unwrap();
+    harness.send(43, APP_EXEC, &execution);
+    let mut output = Vec::new();
+    while !output.ends_with(b"\n") {
+        let reply = harness.next_response();
+        assert_eq!(
+            (reply.kind, reply.request_id, reply.status),
+            (APP_STDOUT, 43, 0)
+        );
+        output.extend_from_slice(&reply.payload);
+    }
+    let process = std::str::from_utf8(&output).unwrap().trim_end().parse();
+    let process = sys::ProcessId::from_positive(process.unwrap()).unwrap();
+    (harness, payload, ready, process)
+}
+
+#[test]
+fn restored_activation_retries_during_a_workload_get_cached_ready_or_end_the_session() -> TestResult
+{
+    if super::super::tests::isolate_process_test(
+        "NVX_RESTORED_RUNNING_ACTIVATION_TEST",
+        "guest::managed_agent::dispatch::tests::restored_activation_retries_during_a_workload_get_cached_ready_or_end_the_session",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (_identical, mut system) = TestSystem::with_direct();
+    system.direct_starter = Some(super::super::seam::tests::start_as_privileged);
+    let (mut harness, payload, ready, process) = running_restored_workload(system);
+    assert_eq!(
+        harness.request_all(44, APP_ACTIVATE, &payload),
+        vec![response(APP_READY, 44, 0, &ready)]
+    );
+    assert!(sys::process_exists(process));
+    assert_eq!(
+        harness.request_all(43, APP_CANCEL, &[]),
+        vec![response(APP_EXIT, 43, 137, b"cancelled")]
+    );
+    assert!(harness.stop().diagnostics.is_empty());
+
+    // A changed activation fails the started one, which ends the workload and the session
+    // without a reply.
+    let (_changed, mut system) = TestSystem::with_direct();
+    system.direct_starter = Some(super::super::seam::tests::start_as_privileged);
+    let (mut harness, payload, _, process) = running_restored_workload(system);
+    let (record, _) = protocol::decode_activate_payload(&payload)?;
+    let mut configuration = record.configuration().clone();
+    configuration.view.hostname = b"changed".to_vec();
+    let record =
+        crate::guest_restore::GuestRestoreRecord::new(record.restore().copied(), configuration)?;
+    harness.send(
+        44,
+        APP_ACTIVATE,
+        &[&payload[..9], record.encode().as_slice()].concat(),
+    );
+    harness
+        .host
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+    assert_eq!(harness.host.read(&mut [0])?, 0);
+    let (outcome, system) = harness.thread.join().unwrap();
+    assert_eq!(outcome.err(), Some(Errno::EPROTO));
+    assert_eq!(
+        system.diagnostics,
+        format!(
+            "NVX-MANAGED-ERROR: stage=data status={}\n",
+            Errno::EPROTO as i32
+        )
+        .as_bytes()
+    );
+    assert!(!sys::process_exists(process));
+    Ok(())
+}
+
+#[test]
+fn mapping_sequence_errors_are_reported_through_dispatch() {
+    let (temporary, system) = TestSystem::with_host_export();
+    let target = temporary.path().canonicalize().unwrap().join("guest/src");
+    let moved = target.display().to_string();
+    let target = target.as_os_str().as_bytes();
+    let entry = [(b"0/src".as_slice(), target, 0)];
+    let mut harness = Harness::with_system(system, 1);
+    let mut replies = Vec::new();
+    replies.extend(harness.request_all(1, APP_MAPS, &maps_payload(1, &entry, None)));
+    replies.extend(harness.request_all(
+        2,
+        APP_MAPS,
+        &maps_payload(0, &[(b"0/src", target, 0), (b"0/src", target, 0)], None),
+    ));
+    replies.extend(harness.request_all(3, APP_MAPS, &maps_payload(0, &entry, None)));
+    replies.extend(harness.request_all(4, APP_MAPS, &maps_payload(1, &entry, None)));
+    assert_eq!(
+        replies,
+        vec![
+            response(APP_ERROR, 1, Errno::EINVAL as i32, b"invalid-request"),
+            response(APP_ERROR, 2, Errno::EINVAL as i32, b"invalid-request"),
+            response(APP_READY, 3, 0, b""),
+            response(APP_ERROR, 4, Errno::EINVAL as i32, b"invalid-request"),
+        ]
+    );
+    let system = harness.stop();
+    assert_eq!(system.kernel.moves(), [moved]);
+    assert_eq!(system.spawn_calls, 0);
+}
+
+#[test]
+fn a_failed_mapping_keeps_refusing_workloads_through_dispatch() {
+    let (temporary, system) = TestSystem::with_host_export();
+    let target = temporary
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("guest/missing");
+    let missing = maps_payload(0, &[(b"0/missing", target.as_os_str().as_bytes(), 0)], None);
+    let valid = maps_payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
+    let mut harness = Harness::with_system(system, 2);
+    let mut replies = Vec::new();
+    replies.extend(harness.request_all(1, APP_MAPS, &missing));
+    replies.extend(harness.request_all(2, APP_EXEC, &[]));
+    replies.extend(harness.request_all(3, APP_MAPS, &valid));
+    assert_eq!(
+        replies,
+        vec![
+            response(APP_ERROR, 1, Errno::ENOENT as i32, b"mapping-failed"),
+            response(APP_ERROR, 2, Errno::EAGAIN as i32, b"mappings-incomplete"),
+            response(APP_ERROR, 3, Errno::EINVAL as i32, b"invalid-request"),
+        ]
+    );
+    let system = harness.stop();
+    assert!(system.kernel.calls().is_empty());
+    assert_eq!(system.spawn_calls, 0);
+}
+
+#[test]
+fn unannounced_mapping_tables_are_refused_through_dispatch() {
+    let (temporary, system) = TestSystem::with_host_export();
+    let target = temporary.path().canonicalize().unwrap().join("guest/src");
+    let mapping = maps_payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
+    let mut harness = Harness::with_system(system, 0);
+    assert_eq!(
+        harness.request_all(1, APP_MAPS, &mapping),
+        vec![response(
+            APP_ERROR,
+            1,
+            Errno::EINVAL as i32,
+            b"invalid-request"
+        )]
+    );
+    assert_eq!(
+        harness.request_all(2, APP_EXEC, &[]),
+        vec![response(
+            APP_ERROR,
+            2,
+            Errno::EINVAL as i32,
+            b"invalid-request"
+        )]
+    );
+    let system = harness.stop();
+    assert!(system.kernel.calls().is_empty());
+    assert_eq!(system.spawn_calls, 0);
+}
+
+/// Returns a system with a host export, and the canonical path of a sandbox's assembled root
+/// beside it, which is the root of a mount.
+fn sandbox_root() -> (tempfile::TempDir, TestSystem, std::path::PathBuf) {
+    let (temporary, system) = TestSystem::with_host_export();
+    let rootfs = temporary.path().canonicalize().unwrap().join("rootfs");
+    std::fs::create_dir(&rootfs).unwrap();
+    system.kernel.add_mount(&rootfs);
+    (temporary, system, rootfs)
+}
+
+#[test]
+fn prepared_layered_mappings_and_cli_identity_use_the_existing_dispatcher() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_LAYERED_DISPATCH_CHILD",
+        "guest::managed_agent::dispatch::tests::prepared_layered_mappings_and_cli_identity_use_the_existing_dispatcher",
+    ) {
+        return Ok(());
+    }
+    use crate::guest::mappings::{Mapper, MappingTable, Reserved, SourceRoot, TargetRoot};
+
+    let (_temporary, mut system, rootfs) = sandbox_root();
+    system.direct_starter = Some(|request| {
+        assert_eq!((request.uid, request.gid), (1234, 2345));
+        super::super::seam::tests::start_as_privileged(request)
+    });
+    let export = system.paths.hostfs_dir.join("root").canonicalize()?;
+    let source = SourceRoot::open(&export)?;
+    let target = TargetRoot::open_with(&mut system.kernel, &rootfs)?;
+    let mut mapper = Mapper::new(target, Reserved::container_root());
+    let mut table = MappingTable::new(2).unwrap();
+    table
+        .apply(
+            &maps_payload(
+                0,
+                &[(b"0/src", b"/workspace", protocol::MAP_READ_ONLY)],
+                None,
+            ),
+            |batch| {
+                mapper
+                    .apply_with(&mut system.kernel, &source, batch)
+                    .map_err(|failure| (failure.entry(), failure.error().raw_os_error()))
+            },
+        )
+        .unwrap();
+    let mappings = HostMappings::layered(table, mapper, Some(source))?;
+    system.paths.hostfs_dir = rootfs.join("not-the-retained-export");
+    let config = AgentConfig::layered(
+        b"nvx_identity=1234:2345",
+        c"workload".to_owned(),
+        c"/home/workload".to_owned(),
+    )?;
+    let mut harness = Harness::spawn_with(system, config, mappings);
+    harness.reset(1, 7);
+    assert_eq!(harness.request(APP_PING, &[]).kind, APP_READY);
+    assert_eq!(
+        harness.request(APP_EXEC, &exec_payload(None)),
+        response(APP_ERROR, 42, Errno::EAGAIN as i32, b"mappings-incomplete")
+    );
+    harness.reset(2, 0);
+    assert_eq!(
+        harness.request(APP_MAPS, &maps_payload(0, &[(b"1", b"/out", 0)], None)),
+        response(APP_ERROR, 42, Errno::EINVAL as i32, b"invalid-request")
+    );
+    assert_eq!(
+        harness
+            .request(APP_MAPS, &maps_payload(1, &[(b"1", b"/out", 0)], None))
+            .kind,
+        APP_READY
+    );
+    assert_eq!(
+        stdout_from(
+            harness.request_all(
+                9,
+                APP_EXEC,
+                &workload_payload(&["/bin/sh", "-c", "printf layered; exit 7"], Some("/"))?,
+            ),
+            9,
+            7
+        ),
+        b"layered"
+    );
+    let system = harness.stop();
+    let expected: Vec<_> = [
+        (
+            export.join("0/src"),
+            rootfs.join("workspace"),
+            Access::ReadOnly,
+        ),
+        (export.join("1"), rootfs.join("out"), Access::ReadWrite),
+    ]
+    .into_iter()
+    .flat_map(|(from, to, access)| attach_calls(&from, &to, access))
+    .collect();
+    assert_eq!(system.kernel.calls(), expected);
+    assert_eq!(system.spawn_calls, 1);
+    Ok(())
+}
+
+#[test]
+fn a_layered_root_without_an_export_refuses_maps_but_keeps_its_complete_table() {
+    use crate::guest::mappings::{Mapper, MappingTable, Reserved, TargetRoot};
+
+    let (_temporary, mut system, rootfs) = sandbox_root();
+    let mapper = Mapper::new(
+        TargetRoot::open_with(&mut system.kernel, &rootfs).unwrap(),
+        Reserved::container_root(),
+    );
+    let mappings = HostMappings::layered(MappingTable::new(0).unwrap(), mapper, None).unwrap();
+    let config =
+        AgentConfig::layered(b"nvx_identity=1000:1000", c"workload".into(), c"/".into()).unwrap();
+    let mut harness = Harness::spawn_with(system, config, mappings);
+    harness.reset(1, 0);
+    for payload in [
+        maps_payload(0, &[], None),
+        maps_payload(0, &[(b"0", b"/workspace", 0)], None),
+    ] {
+        assert_eq!(
+            harness.request(APP_MAPS, &payload),
+            response(APP_ERROR, 42, Errno::EINVAL as i32, b"invalid-request")
+        );
+    }
+    harness.reset(2, 0);
+    assert_eq!(harness.request(APP_PING, &[]).kind, APP_READY);
+    let system = harness.stop();
+    assert!(system.kernel.calls().is_empty());
+}
+
+#[test]
+fn direct_does_not_launch_when_identity_export_fails() {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_HOME_EXPORT_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::direct_does_not_launch_when_identity_export_fails",
+    ) {
+        return;
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock().unwrap();
+    let (_temporary, mut system) = TestSystem::with_direct();
+    system.fail_environment = Some(b"HOME".to_vec());
+    assert_environment_failure(
+        Harness::with_system(system, 0),
+        b"nvx-managed-agent: cannot configure workload environment: ",
+    );
+}
+
+#[test]
+fn pwd_export_failures_refuse_launch_without_spawning() {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_PWD_EXPORT_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::pwd_export_failures_refuse_launch_without_spawning",
+    ) {
+        return;
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock().unwrap();
+    let (temporary, mut system) = TestSystem::with_direct();
+    system.fail_environment = Some(b"PWD".to_vec());
+    let mut harness = Harness::with_system(system, 0);
+    for (request_id, cwd) in [(42, None), (43, Some(temporary.path().to_str().unwrap()))] {
+        assert_eq!(
+            harness.request_all(request_id, APP_EXEC, &exec_payload(cwd)),
+            vec![response(
+                APP_ERROR,
+                request_id,
+                125,
+                protocol::LAUNCH_FAILED.as_bytes()
+            )]
+        );
+    }
+    let system = harness.stop();
+    assert_eq!(system.spawn_calls, 0);
+}
+
+#[test]
+fn agent_refuses_malformed_working_directories() {
+    let mut harness = Harness::new();
+    let argument = [9u32.to_le_bytes().as_slice(), b"/bin/true"].concat();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&1u16.to_le_bytes());
+    payload.extend_from_slice(&2u16.to_le_bytes());
+    payload.extend_from_slice(&argument);
+    let response = harness.request(APP_EXEC, &payload);
+    assert_eq!(
+        (response.kind, response.status, response.payload.as_slice()),
+        (APP_ERROR, Errno::EINVAL as i32, INVALID_REQUEST.as_bytes())
+    );
+    harness.stop();
+}
+
+#[test]
+fn data_validation_diagnostics_preserve_the_c_failure_stage_and_status() {
+    let data = format!(
+        "NVX-MANAGED-ERROR: stage=data status={}\n",
+        Errno::EPROTO as i32
+    );
+    let frame = frame(APP_PING, 42, &[]);
+    let diagnostics =
+        Harness::new().fail(&encode_outer(OUTER_DATA, &INSTANCE, 1, 9, &frame).unwrap());
+    assert_eq!(
+        diagnostics,
+        [
+            b"NVX-MANAGED-ERROR: stage=data-sequence status=9\n",
+            data.as_bytes()
+        ]
+        .concat()
+    );
+
+    let diagnostics =
+        Harness::new().fail(&encode_outer(OUTER_DATA, &INSTANCE, 2, 8, &frame).unwrap());
+    assert_eq!(
+        diagnostics,
+        [
+            b"NVX-MANAGED-ERROR: stage=data-identity status=2\n",
+            data.as_bytes()
+        ]
+        .concat()
+    );
+
+    let diagnostics =
+        Harness::new().fail(&encode_outer(OUTER_DATA, &INSTANCE, 1, 8, b"x").unwrap());
+    assert_eq!(
+        diagnostics,
+        [
+            b"NVX-MANAGED-ERROR: stage=data-application status=1\n",
+            data.as_bytes()
+        ]
+        .concat()
+    );
+}
+
+#[test]
+fn a_request_that_fails_after_validation_reports_the_data_stage() {
+    // A restored agent's activate request passes the validation of its frame, and its record,
+    // which does not decode, then ends the session.
+    let config = AgentConfig::for_test();
+    let mappings = HostMappings::announced(0);
+    let (capture, _) = Capture::activation_fixture();
+    let system = TestSystem::new(Paths::default());
+    let mut harness = Harness::spawn_with_capture(system, config, mappings, Some(capture));
+    harness.reset(1, 7);
+    let frame = frame(APP_ACTIVATE, 42, b"x");
+    let diagnostics = harness.fail(&encode_outer(OUTER_DATA, &INSTANCE, 1, 8, &frame).unwrap());
+    assert_eq!(
+        diagnostics,
+        format!(
+            "NVX-MANAGED-ERROR: stage=data status={}\n",
+            Errno::EPROTO as i32
+        )
+        .as_bytes()
+    );
+}
+
+/// Outcome of a test that fails with the first error that it meets.
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// Returns the payload of an `EXEC` request for `argv` in `cwd`, with the default environment,
+/// or why the workload cannot be encoded.
+fn workload_payload(argv: &[&str], cwd: Option<&str>) -> Result<Vec<u8>, ProtocolError> {
+    encode_exec_payload(&Workload {
+        argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
+        timeout_ms: 0,
+        cwd,
+        environment: WorkloadEnvironment::Default,
+    })
+}
+
+/// Returns `path` as UTF-8, or an error that names it.
+fn utf8(path: &std::path::Path) -> Result<&str, Box<dyn std::error::Error>> {
+    path.to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", path.display()).into())
+}
+
+/// A directory that only a process that bypasses directory permissions may search while
+/// this lives, after which its owner may search it again, so that an unprivileged test can
+/// remove its temporary directory.
+struct Unsearchable(std::path::PathBuf);
+
+impl Unsearchable {
+    /// Creates the directory `path` without any permissions.
+    fn new(path: std::path::PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir(&path)?;
+        let unsearchable = Self(path);
+        std::fs::set_permissions(&unsearchable.0, std::fs::Permissions::from_mode(0o000))?;
+        Ok(unsearchable)
+    }
+}
+
+impl Drop for Unsearchable {
+    fn drop(&mut self) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Err(error) =
+            std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700))
+        {
+            // Logging is best effort: a test guard has no caller to report to.
+            let _ = writeln!(
+                std::io::stderr(),
+                "cannot restore the permissions of {}: {error}",
+                self.0.display()
+            );
+        }
+    }
+}
+
+/// Starts a native direct workload with its real credential calls.
+fn start_with_real_credentials(
+    request: crate::guest::init::ExecRequest,
+) -> Result<crate::guest::init::Exec, crate::guest::init::StartFailure> {
+    crate::guest::init::Exec::start(request)
+}
+
+fn start_after_pending_statuses_are_collected(
+    request: crate::guest::init::ExecRequest,
+) -> Result<crate::guest::init::Exec, crate::guest::init::StartFailure> {
+    let process =
+        sys::ProcessId::from_positive(request.arguments[1].to_str().unwrap().parse().unwrap())
+            .unwrap();
+    assert!(
+        !process.is_unreaped().unwrap(),
+        "a pending child status reached the next native start",
+    );
+    super::super::seam::tests::start_as_privileged(request)
+}
+
+#[test]
+fn direct_start_collects_pending_statuses_before_forking() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_PRESTART_REAP_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::direct_start_collects_pending_statuses_before_forking",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    sys::reset_child_signal();
+    let (_temporary, mut system) = TestSystem::with_direct();
+    system.direct_starter = Some(start_after_pending_statuses_are_collected);
+    let mut harness = Harness::with_system(system, 0);
+    let mut pending = std::process::Command::new("/bin/true").spawn()?;
+    let process = sys::ProcessId::from_child(&pending);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !sys::tests::has_exited(process)? {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the previous child did not exit",
+        );
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(process.is_unreaped()?);
+    assert_eq!(
+        harness.request_all(
+            42,
+            APP_EXEC,
+            &workload_payload(&["/bin/true", &pending.id().to_string()], None)?,
+        ),
+        vec![response(APP_EXIT, 42, 0, b"exit")],
+    );
+    assert_eq!(
+        pending.wait().unwrap_err().raw_os_error(),
+        Some(Errno::ECHILD as i32),
+    );
+    assert!(harness.stop().diagnostics.is_empty());
+    Ok(())
+}
+
+/// Fails the native post-fork setup and its cleanup, leaving the collector a live child.
+fn start_with_failed_pidfd_and_cleanup(
+    request: crate::guest::init::ExecRequest,
+) -> Result<crate::guest::init::Exec, crate::guest::init::StartFailure> {
+    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        request.arguments.last().unwrap().as_bytes(),
+    ));
+    sys::tests::deny_system_call(nix::libc::SYS_pidfd_open);
+    sys::tests::deny_system_call(nix::libc::SYS_kill);
+    let failure = crate::guest::init::Exec::start_simulated(request, None)
+        .err()
+        .expect("pidfd_open must fail after the fork");
+    let process = failure
+        .process
+        .expect("the failed start must own its child");
+    assert_eq!(failure.error.raw_os_error(), Some(Errno::EPERM as i32));
+    assert_eq!(failure.cleanup, Some(Errno::EPERM));
+    std::fs::write(path, process.line()).unwrap();
+    Err(failure)
+}
+
+#[test]
+fn failed_direct_starts_keep_their_child_until_collected_or_explicitly_lost() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_FAILED_START_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::failed_direct_starts_keep_their_child_until_collected_or_explicitly_lost",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            sys::reset_child_signal();
+        }
+    }
+    let _reset = Reset;
+    for automatic in [false, true] {
+        sys::reset_child_signal();
+        if automatic {
+            sys::tests::reap_children_automatically(true)?;
+        }
+        let (temporary, mut system) = TestSystem::with_direct();
+        system.direct_starter = Some(start_with_failed_pidfd_and_cleanup);
+        let marker = temporary.path().join("failed-child");
+        let mut harness = Harness::with_system(system, 0);
+        harness
+            .host
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let mut diagnostics = Vec::new();
+        for request_id in 42..45 {
+            assert_eq!(
+                harness.request_all(
+                    request_id,
+                    APP_EXEC,
+                    &workload_payload(
+                        &["/bin/sh", "-c", "sleep 0.03; exit 19", "_", utf8(&marker)?],
+                        None,
+                    )?,
+                ),
+                vec![response(
+                    APP_ERROR,
+                    request_id,
+                    125,
+                    protocol::LAUNCH_FAILED.as_bytes()
+                )]
+            );
+            let process =
+                sys::ProcessId::from_positive(std::fs::read_to_string(&marker)?.trim().parse()?)
+                    .expect("the marker names this test's failed child");
+            assert!(
+                !process.is_unreaped()?,
+                "the agent returned idle before collection"
+            );
+            for stage in ["exec-launch", "exec-kill"] {
+                diagnostics.extend_from_slice(
+                    format!(
+                        "NVX-MANAGED-ERROR: stage={stage} status={}\n",
+                        Errno::EPERM as i32
+                    )
+                    .as_bytes(),
+                );
+            }
+            if automatic {
+                diagnostics.extend_from_slice(
+                    format!(
+                        "NVX-MANAGED-ERROR: stage=exec-wait status={}\n",
+                        Errno::ECHILD as i32
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        assert_eq!(harness.request(APP_PING, &[]).kind, APP_READY);
+        let system = harness.stop();
+        assert_eq!(system.spawn_calls, 3);
+        assert_eq!(system.diagnostics, diagnostics);
+    }
+    Ok(())
+}
+
+#[test]
+fn direct_launch_refuses_working_directories_that_the_workload_cannot_enter() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_CWD_REFUSAL_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::direct_launch_refuses_working_directories_that_the_workload_cannot_enter",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut system) = TestSystem::with_direct();
+    let root = temporary.path();
+    // With the privilege to change credentials, the child takes the workload's real
+    // identity, which must reach the directories. Otherwise its credential calls are
+    // replaced, and the test's own identity meets the same refusals unless it may bypass
+    // directory permissions, which leaves nothing to check.
+    if holds_capability(CAP_SETUID)? && holds_capability(CAP_SETGID)? {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))?;
+        system.direct_starter = Some(start_with_real_credentials);
+    } else if holds_capability(CAP_DAC_OVERRIDE)? || holds_capability(CAP_DAC_READ_SEARCH)? {
+        return Ok(());
+    } else {
+        system.direct_starter = Some(super::super::seam::tests::start_as_privileged);
+    }
+    let file = root.join("file");
+    std::fs::write(&file, b"")?;
+    let unsearchable = Unsearchable::new(root.join("unsearchable"))?;
+    let marker = root.join("ran");
+    let marker = utf8(&marker)?;
+    let mut harness = Harness::with_system(system, 0);
+    for (request_id, directory, error) in [
+        (42, root.join("missing"), Errno::ENOENT),
+        (43, file, Errno::ENOTDIR),
+        (44, unsearchable.0.clone(), Errno::EACCES),
+    ] {
+        let directory = utf8(&directory)?;
+        let diagnostic = super::super::diagnostics::with_description(
+            format!("nvx-managed-agent: cannot enter working directory {directory}: ").as_bytes(),
+            error,
+        );
+        assert_eq!(
+            harness.request_all(
+                request_id,
+                APP_EXEC,
+                &workload_payload(&["/bin/touch", marker], Some(directory))?,
+            ),
+            vec![
+                response(APP_STDERR, request_id, 0, &diagnostic),
+                response(APP_ERROR, request_id, error as i32, b"cwd-failed"),
+            ],
+            "{directory}"
+        );
+    }
+    let system = harness.stop();
+    assert_eq!(system.spawn_calls, 3);
+    assert!(system.diagnostics.is_empty());
+    assert!(!std::path::Path::new(marker).exists());
+    Ok(())
+}
+
+#[test]
+fn direct_launch_refuses_a_failed_identity_change_and_runs_nothing() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_IDENTITY_FAILURE_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::direct_launch_refuses_a_failed_identity_change_and_runs_nothing",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut system) = TestSystem::with_direct();
+    system.direct_starter = Some(super::super::seam::tests::start_with_failing_credentials);
+    let marker = temporary.path().join("ran");
+    let payload = workload_payload(&["/bin/touch", utf8(&marker)?], None)?;
+    let mut harness = Harness::with_system(system, 0);
+    assert_eq!(
+        harness.request_all(42, APP_EXEC, &payload),
+        vec![response(
+            APP_ERROR,
+            42,
+            125,
+            protocol::LAUNCH_FAILED.as_bytes()
+        )]
+    );
+    let system = harness.stop();
+    assert_eq!(
+        system.diagnostics,
+        format!(
+            "NVX-MANAGED-ERROR: stage=exec-launch status={}\n",
+            Errno::EPERM as i32
+        )
+        .as_bytes()
+    );
+    assert!(!marker.exists());
+    Ok(())
+}
+
+#[test]
+fn a_reset_does_not_wait_for_output_from_an_escaped_direct_descendant() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_RESET_OUTPUT_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::a_reset_does_not_wait_for_output_from_an_escaped_direct_descendant",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut harness) = direct_harness();
+    harness
+        .host
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+    let exit = Gate::new(temporary.path().join("exit"))?;
+    let output = Gate::new(temporary.path().join("output"))?;
+    let escaped = temporary.path().join("escaped");
+    let payload = workload_payload(
+        &[
+            "/bin/sh",
+            "-c",
+            "exec 3<\"$0\" 4<\"$1\"; \
+             setsid sh -c 'echo $$ > \"$0\"; read -r line; echo late' \"$2\" <&4 & \
+             echo $$; read -r line <&3; exit 3",
+            utf8(&exit.path)?,
+            utf8(&output.path)?,
+            utf8(&escaped)?,
+        ],
+        None,
+    )?;
+    harness.send(42, APP_EXEC, &payload);
+    let leader = harness.next_response();
+    assert_eq!(
+        (leader.kind, leader.request_id, leader.status),
+        (APP_STDOUT, 42, 0)
+    );
+    let leader = std::str::from_utf8(&leader.payload)?
+        .trim()
+        .parse::<u32>()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !escaped.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "descendant did not leave the group"
+        );
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    drop(exit);
+    wait_for_process_exit(leader)?;
+    harness.reset(2, 17);
+    assert_eq!(
+        harness.request_all(43, APP_EXEC, &workload_payload(&["/bin/true"], None)?),
+        vec![response(APP_EXIT, 43, 0, b"exit")]
+    );
+    let descendant = std::fs::read_to_string(&escaped)?.trim().parse::<u32>()?;
+    drop(output);
+    wait_for_process_exit(descendant)?;
+    assert!(harness.stop().diagnostics.is_empty());
+    Ok(())
+}
+
+#[test]
+fn direct_endings_do_not_wait_for_an_escaped_descendant_to_close_output() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_ENDING_OUTPUT_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::direct_endings_do_not_wait_for_an_escaped_descendant_to_close_output",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut harness) = direct_harness();
+    harness
+        .host
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+    for (request_id, ending, status) in [(42, "cancelled", 137), (43, "timeout", 124)] {
+        let exit = Gate::new(temporary.path().join(format!("exit-{request_id}")))?;
+        let output = Gate::new(temporary.path().join(format!("output-{request_id}")))?;
+        let finish = Gate::new(temporary.path().join(format!("finish-{request_id}")))?;
+        let escaped = temporary.path().join(format!("escaped-{request_id}"));
+        // The finish gate ends only this escaped group, even after its readers have closed.
+        let payload = encode_exec_payload(&Workload {
+            argv: [
+                "/bin/sh",
+                "-c",
+                "exec 3<\"$0\" 4<\"$1\" 5<\"$2\"; \
+                 setsid sh -c 'echo $$ > \"$0\"; read -r line <&4; \
+                 read -r line <&5' \"$3\" & \
+                 echo $$; read -r line <&3",
+                utf8(&exit.path)?,
+                utf8(&output.path)?,
+                utf8(&finish.path)?,
+                utf8(&escaped)?,
+            ]
+            .map(str::to_owned)
+            .into(),
+            timeout_ms: if ending == "timeout" { 3000 } else { 0 },
+            cwd: None,
+            environment: WorkloadEnvironment::Default,
+        })?;
+        harness.send(request_id, APP_EXEC, &payload);
+        let leader = harness.next_response();
+        assert_eq!(
+            (leader.kind, leader.request_id, leader.status),
+            (APP_STDOUT, request_id, 0)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !escaped.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant did not leave the group"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if ending == "cancelled" {
+            harness.send(request_id, APP_CANCEL, &[]);
+        }
+        let mut responses = harness.responses();
+        assert_eq!(
+            responses.pop(),
+            Some(response(APP_EXIT, request_id, status, ending.as_bytes()))
+        );
+        for response in responses {
+            assert_eq!(
+                (response.kind, response.request_id, response.status),
+                (APP_STDOUT, request_id, 0)
+            );
+        }
+        let descendant = std::fs::read_to_string(&escaped)?.trim().parse::<u32>()?;
+        drop(output);
+        drop(finish);
+        drop(exit);
+        wait_for_process_exit(descendant)?;
+    }
+    assert!(harness.stop().diagnostics.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_workload_status_that_the_agent_cannot_collect_still_ends_its_request() -> TestResult {
+    // While `SIGCHLD` is ignored, which applies to the whole process, the kernel collects
+    // every child's status itself, so the test runs in a process of its own.
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_LOST_STATUS_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::a_workload_status_that_the_agent_cannot_collect_still_ends_its_request",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut harness) = lost_status_harness()?;
+    let payload = encode_exec_payload(&Workload {
+        argv: vec!["/bin/sleep".to_owned(), "30".to_owned()],
+        timeout_ms: 100,
+        cwd: None,
+        environment: WorkloadEnvironment::Default,
+    })?;
+    assert_eq!(
+        harness.request_all(42, APP_EXEC, &payload),
+        vec![response(APP_EXIT, 42, 124, b"timeout")]
+    );
+    // Without a cause, the agent knows no outcome but its failure. The workload exits on its
+    // own, but only once its output has shown that the agent named it by its pidfd: the
+    // kernel collects its status as it ends, and `Execution::new` would fail with `ESRCH`
+    // if that came first.
+    let exit = Gate::new(temporary.path().join("exit"))?;
+    let payload = encode_exec_payload(&Workload {
+        argv: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "exec 3<\"$0\"; echo ready; read -r line <&3; exit 3".to_owned(),
+            utf8(&exit.path)?.to_owned(),
+        ],
+        timeout_ms: 0,
+        cwd: None,
+        environment: WorkloadEnvironment::Default,
+    })?;
+    harness.send(43, APP_EXEC, &payload);
+    assert_eq!(
+        harness.next_response(),
+        response(APP_STDOUT, 43, 0, b"ready\n")
+    );
+    drop(exit);
+    assert_eq!(
+        harness.responses(),
+        vec![response(APP_EXIT, 43, 125, b"failed")]
+    );
+    let system = harness.stop();
+    assert_eq!(system.diagnostics, lost_status_diagnostics(2));
+    Ok(())
+}
+
+#[test]
+fn a_control_failure_after_a_lost_status_does_not_wait_again() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_LOST_CONTROL_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::a_control_failure_after_a_lost_status_does_not_wait_again",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut harness) = lost_status_harness()?;
+    let exit = Gate::new(temporary.path().join("exit"))?;
+    let output = Gate::new(temporary.path().join("output"))?;
+    let escaped = temporary.path().join("escaped");
+    let payload = workload_payload(
+        &[
+            "/bin/sh",
+            "-c",
+            "exec 3<\"$0\" 4<\"$1\"; \
+             setsid sh -c 'echo $$ > \"$0\"; read -r line' \"$2\" <&4 & \
+             echo $$; read -r line <&3; exit 3",
+            utf8(&exit.path)?,
+            utf8(&output.path)?,
+            utf8(&escaped)?,
+        ],
+        None,
+    )?;
+    harness.send(42, APP_EXEC, &payload);
+    let leader = harness.next_response();
+    assert_eq!(
+        (leader.kind, leader.request_id, leader.status),
+        (APP_STDOUT, 42, 0),
+    );
+    let leader = std::str::from_utf8(&leader.payload)?
+        .trim()
+        .parse::<u32>()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !escaped.exists() || std::fs::metadata(&escaped)?.len() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "descendant did not start"
+        );
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let descendant = std::fs::read_to_string(&escaped)?.trim().parse::<u32>()?;
+    drop(exit);
+    wait_for_process_exit(leader)?;
+    for _ in 0..2 {
+        assert_eq!(harness.request(APP_PING, &[]).kind, APP_BUSY);
+    }
+    harness.host.write_all(&encode_outer(
+        OUTER_WAIT,
+        &INSTANCE,
+        harness.epoch,
+        harness.host_sequence,
+        &[],
+    )?)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !harness.thread.is_finished() && std::time::Instant::now() < deadline {
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let stopped_with_open_output = harness.thread.is_finished();
+    drop(output);
+    wait_for_process_exit(descendant)?;
+    assert!(
+        stopped_with_open_output,
+        "control failure waited again for a status already reported lost",
+    );
+    let (outcome, system) = harness.thread.join().unwrap();
+    assert_eq!(outcome.err(), Some(Errno::EPROTO));
+    let mut diagnostics = lost_status_diagnostics(1);
+    diagnostics.extend_from_slice(
+        format!(
+            "NVX-MANAGED-ERROR: stage=exec-record status={OUTER_WAIT}\n\
+             NVX-MANAGED-ERROR: stage=data status={}\n",
+            Errno::EPROTO as i32
+        )
+        .as_bytes(),
+    );
+    assert_eq!(system.diagnostics, diagnostics);
+    Ok(())
+}
+
+#[test]
+fn a_lost_status_keeps_its_outcome_through_a_later_cancellation_or_timeout() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_LOST_OUTCOME_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::a_lost_status_keeps_its_outcome_through_a_later_cancellation_or_timeout",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut harness) = lost_status_harness()?;
+    let timeout_ms = 1000;
+    let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
+    // Each workload exits on its own once the test opens `exit`, while a descendant holds
+    // its output open until the test opens `output`. In between, the test cancels the first
+    // workload, and lets the timeout of the second pass.
+    for (request_id, cancelled) in [(42, true), (43, false)] {
+        let exit = Gate::new(temporary.path().join(format!("exit-{request_id}")))?;
+        let output = Gate::new(temporary.path().join(format!("output-{request_id}")))?;
+        let escaped = temporary.path().join(format!("escaped-{request_id}"));
+        let payload = encode_exec_payload(&Workload {
+            argv: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "exec 3<\"$0\" 4<\"$1\"; \
+                     setsid sh -c 'echo escaped > \"$0\"; read -r line; echo late' \"$2\" <&4 & \
+                     echo $$; read -r line <&3; exit 3"
+                    .to_owned(),
+                utf8(&exit.path)?.to_owned(),
+                utf8(&output.path)?.to_owned(),
+                utf8(&escaped)?.to_owned(),
+            ],
+            timeout_ms: if cancelled { 0 } else { timeout_ms },
+            cwd: None,
+            environment: WorkloadEnvironment::Default,
+        })?;
+        let sent = std::time::Instant::now();
+        harness.send(request_id, APP_EXEC, &payload);
+        let leader = harness.next_response();
+        assert_eq!(
+            (leader.kind, leader.request_id, leader.status),
+            (APP_STDOUT, request_id, 0)
+        );
+        let leader = std::str::from_utf8(&leader.payload)?
+            .trim()
+            .parse::<u32>()?;
+        let ready = std::time::Instant::now();
+        let deadline = ready + std::time::Duration::from_secs(20);
+        while !escaped.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant did not leave the group"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(exit);
+        wait_for_process_exit(leader)?;
+        // Two completed loop turns ensure that the core has noticed the lost leader status.
+        for _ in 0..2 {
+            assert_eq!(
+                harness.request(APP_PING, &[]),
+                response(APP_BUSY, 42, 0, b"")
+            );
+        }
+        if cancelled {
+            // The credit tells that the agent took the cancellation, before the output
+            // closes.
+            harness.send(request_id, APP_CANCEL, &[]);
+        } else {
+            assert!(
+                sent.elapsed() < timeout,
+                "the workload ended after its timeout"
+            );
+            // Every turn of the agent's loop checks the timeout, at least once a poll.
+            let passed = ready + timeout + std::time::Duration::from_millis(200);
+            thread::sleep(passed.saturating_duration_since(std::time::Instant::now()));
+        }
+        drop(output);
+        assert_eq!(
+            harness.responses(),
+            vec![
+                response(APP_STDOUT, request_id, 0, b"late\n"),
+                response(APP_EXIT, request_id, 125, b"failed")
+            ]
+        );
+    }
+    let system = harness.stop();
+    assert_eq!(system.diagnostics, lost_status_diagnostics(2));
+    Ok(())
+}
+
+/// Starts a direct agent in a process that ignores `SIGCHLD`, which applies to the whole
+/// process: the kernel collects every status of the agent's children itself. Returns the
+/// temporary directory of the plain-process agent, and the harness.
+fn lost_status_harness() -> Result<(tempfile::TempDir, Harness), Box<dyn std::error::Error>> {
+    let (temporary, mut system) = TestSystem::with_direct();
+    system.direct_starter = Some(super::super::seam::tests::start_as_privileged);
+    crate::guest::sys::ignore_signals(&[crate::guest::sys::Signal::SIGCHLD]);
+    let harness = Harness::with_system(system, 0);
+    // An agent that waited for a lost status would never answer.
+    harness
+        .host
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+    Ok((temporary, harness))
+}
+
+/// Returns the diagnostics of `count` lost workload statuses.
+fn lost_status_diagnostics(count: usize) -> Vec<u8> {
+    format!(
+        "NVX-MANAGED-ERROR: stage=exec-wait status={}\n",
+        Errno::ECHILD as i32
+    )
+    .repeat(count)
+    .into_bytes()
+}
+
+/// A FIFO that the test holds open. A workload that reads it waits until the test drops the
+/// gate, which a failing test does too, so that no workload outlives the test.
+struct Gate {
+    /// The FIFO's path, which the workload opens.
+    path: std::path::PathBuf,
+    /// The test's end, which keeps the FIFO open for writing.
+    _end: std::fs::File,
+}
+
+impl Gate {
+    /// Creates the FIFO at `path`, and opens the test's end.
+    fn new(path: std::path::PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        crate::guest::sys::tests::create_fifo(
+            &CString::new(path.as_os_str().as_bytes())?,
+            crate::guest::sys::Mode::S_IRUSR | crate::guest::sys::Mode::S_IWUSR,
+        )?;
+        // Linux opens a FIFO for reading and writing without waiting for another end.
+        let end = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        Ok(Self { path, _end: end })
+    }
+}
+
+/// Waits until the kernel has auto-reaped the leader whose status the agent cannot collect.
+fn wait_for_process_exit(process: u32) -> TestResult {
+    let process = crate::guest::sys::ProcessId::from_positive(i64::from(process)).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while crate::guest::sys::process_exists(process) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the leader did not exit"
+        );
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[test]
+fn direct_launch_starts_the_workload_in_the_directory_that_it_checked() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_CHECKED_DIRECTORY_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::direct_launch_starts_the_workload_in_the_directory_that_it_checked",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut system) = TestSystem::with_direct();
+    let root = std::fs::canonicalize(temporary.path())?;
+    let checked = root.join("checked");
+    let moved = root.join("moved");
+    let first = root.join("first");
+    let second = root.join("second");
+    let link = root.join("link");
+    for directory in [&checked, &first, &second] {
+        std::fs::create_dir(directory)?;
+    }
+    std::os::unix::fs::symlink(&first, &link)?;
+    let script = "if [ -d \"$1\" ]; then mv \"$1\" \"$2\"; fi; ln -sfn \"$4\" \"$3\"; pwd -P";
+    system.direct_starter = Some(super::super::seam::tests::start_as_privileged);
+    let mut harness = Harness::with_system(system, 0);
+    let renamed = harness.request_all(
+        42,
+        APP_EXEC,
+        &workload_payload(
+            &[
+                "/bin/sh",
+                "-c",
+                script,
+                "sh",
+                utf8(&checked)?,
+                utf8(&moved)?,
+                utf8(&link)?,
+                utf8(&second)?,
+            ],
+            Some(utf8(&checked)?),
+        )?,
+    );
+    std::fs::remove_file(&link)?;
+    std::os::unix::fs::symlink(&first, &link)?;
+    let retargeted = harness.request_all(
+        43,
+        APP_EXEC,
+        &workload_payload(
+            &[
+                "/bin/sh",
+                "-c",
+                script,
+                "sh",
+                utf8(&checked)?,
+                utf8(&moved)?,
+                utf8(&link)?,
+                utf8(&second)?,
+            ],
+            Some(utf8(&link)?),
+        )?,
+    );
+    let proc_link = harness.request_all(
+        44,
+        APP_EXEC,
+        &workload_payload(&["/bin/pwd", "-P"], Some("/proc/self/cwd"))?,
+    );
+    let system = harness.stop();
+    let line = |path: &std::path::Path| [path.as_os_str().as_bytes(), b"\n"].concat();
+    assert_eq!(
+        renamed,
+        vec![
+            response(APP_STDOUT, 42, 0, &line(&moved)),
+            response(APP_EXIT, 42, 0, b"exit"),
+        ]
+    );
+    assert_eq!(
+        retargeted,
+        vec![
+            response(APP_STDOUT, 43, 0, &line(&first)),
+            response(APP_EXIT, 43, 0, b"exit"),
+        ]
+    );
+    assert_eq!(
+        stdout_from(proc_link, 44, 0),
+        line(&std::fs::canonicalize(std::env::current_dir()?)?),
+    );
+    assert!(system.diagnostics.is_empty());
+    Ok(())
+}
+
+/// Returns a direct agent using the plain-process core with simulated credentials.
+fn direct_harness() -> (tempfile::TempDir, Harness) {
+    let (temporary, mut system) = TestSystem::with_direct();
+    system.direct_starter = Some(super::super::seam::tests::start_as_privileged);
+    (temporary, Harness::with_system(system, 0))
+}
+
+#[test]
+fn direct_core_applies_inherited_exact_and_layered_environments() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DIRECT_ENVIRONMENT_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::direct_core_applies_inherited_exact_and_layered_environments",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (_temporary, mut harness) = direct_harness();
+    let defaults = workload_payload(
+        &[
+            "/bin/sh",
+            "-c",
+            "printf '%s|%s|%s|%s|%s' \"$HOME\" \"$USER\" \"$LOGNAME\" \"$PWD\" \"$NVX_DIRECT_ENVIRONMENT_TEST_CHILD\"",
+        ],
+        None,
+    )?;
+    assert_eq!(
+        stdout_from(harness.request_all(42, APP_EXEC, &defaults), 42, 0),
+        b"/home/workload|workload|workload|/|1",
+    );
+    let environment = ["EMPTY=", "VALUE=a=b", "PWD=/explicit"].map(str::to_owned);
+    let replaced = encode_exec_payload(&Workload {
+        argv: vec!["/usr/bin/env".to_owned()],
+        timeout_ms: 0,
+        cwd: Some("/tmp/../tmp"),
+        environment: WorkloadEnvironment::Replaced(&environment),
+    })?;
+    assert_eq!(
+        stdout_from(harness.request_all(43, APP_EXEC, &replaced), 43, 0),
+        b"EMPTY=\nVALUE=a=b\nPWD=/explicit\n",
+    );
+    let empty = encode_exec_payload(&Workload {
+        argv: vec!["/usr/bin/env".to_owned()],
+        timeout_ms: 0,
+        cwd: None,
+        environment: WorkloadEnvironment::Replaced(&[]),
+    })?;
+    assert_eq!(
+        stdout_from(harness.request_all(44, APP_EXEC, &empty), 44, 0),
+        b""
+    );
+    let entries = ["HOME=/layered", "ADDED=last"].map(str::to_owned);
+    let layered = encode_exec_payload(&Workload {
+        argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "printf '%s|%s|%s|%s' \"$HOME\" \"$PWD\" \"$ADDED\" \"$NVX_DIRECT_ENVIRONMENT_TEST_CHILD\"".to_owned()],
+        timeout_ms: 0,
+        cwd: Some("/tmp/../tmp"),
+        environment: WorkloadEnvironment::Layered(&entries),
+    })?;
+    assert_eq!(
+        stdout_from(harness.request_all(45, APP_EXEC, &layered), 45, 0),
+        b"/layered|/tmp|last|1",
+    );
+    let system = harness.stop();
+    assert!(system.diagnostics.is_empty());
+    Ok(())
+}
+
+#[test]
+fn direct_core_accepts_large_exact_environments() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DIRECT_LARGE_ENVIRONMENT_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::direct_core_accepts_large_exact_environments",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (_temporary, mut harness) = direct_harness();
+    let entries: Vec<_> = (0..12)
+        .map(|index| format!("KEY{index}={}", "x".repeat(4000)))
+        .collect();
+    let payload = encode_exec_payload(&Workload {
+        argv: vec!["/usr/bin/env".to_owned()],
+        timeout_ms: 0,
+        cwd: None,
+        environment: WorkloadEnvironment::Replaced(&entries),
+    })?;
+    let output = stdout_from(harness.request_all(42, APP_EXEC, &payload), 42, 0);
+    assert_eq!(output, format!("{}\n", entries.join("\n")).into_bytes());
+    assert!(harness.stop().diagnostics.is_empty());
+    Ok(())
+}
+
+#[test]
+fn direct_core_reports_exec_failures_without_a_helper() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DIRECT_EXEC_FAILURE_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::direct_core_reports_exec_failures_without_a_helper",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (temporary, mut harness) = direct_harness();
+    let missing = temporary.path().join("missing");
+    let diagnostic = super::super::diagnostics::with_description(
+        b"nvx-managed-agent: cannot execute workload: ",
+        Errno::ENOENT,
+    );
+    assert_eq!(
+        harness.request_all(42, APP_EXEC, &workload_payload(&[utf8(&missing)?], None)?),
+        vec![
+            response(APP_STDERR, 42, 0, &diagnostic),
+            response(APP_EXIT, 42, 125, b"exit")
+        ],
+    );
+    assert!(harness.stop().diagnostics.is_empty());
+    Ok(())
+}
+
+#[test]
+fn normal_completion_kills_the_direct_process_group() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DIRECT_GROUP_COMPLETION_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::normal_completion_kills_the_direct_process_group",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (_temporary, mut harness) = direct_harness();
+    let mut replies = harness.request_all(
+        42,
+        APP_EXEC,
+        &workload_payload(&["/bin/sh", "-c", "sleep 30 & echo $!; exit 7"], None)?,
+    );
+    assert_eq!(replies.pop(), Some(response(APP_EXIT, 42, 7, b"exit")));
+    let bytes: Vec<_> = replies
+        .into_iter()
+        .flat_map(|reply| reply.payload)
+        .collect();
+    let process = std::str::from_utf8(&bytes)?.trim().parse::<i64>()?;
+    let process = crate::guest::sys::ProcessId::from_positive(process).unwrap();
+    assert!(!crate::guest::sys::ProcessId::live_userspace()?.contains(&process));
+    assert!(harness.stop().diagnostics.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_running_workload_refuses_other_requests_and_ends_when_cancelled_or_late() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_DISPATCH_CANCEL_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::a_running_workload_refuses_other_requests_and_ends_when_cancelled_or_late",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (_temporary, mut harness) = direct_harness();
+    let started = std::time::Instant::now();
+    harness.send(
+        42,
+        APP_EXEC,
+        &workload_payload(&["/bin/sh", "-c", "exec sleep 30"], None)?,
+    );
+    assert_eq!(
+        harness.request_all(43, APP_PING, &[]),
+        vec![response(APP_BUSY, 43, 0, b"")]
+    );
+    // A cancellation of another request leaves the workload running.
+    harness.send(41, APP_CANCEL, &[]);
+    assert_eq!(
+        harness.request_all(42, APP_CANCEL, &[]),
+        vec![response(APP_EXIT, 42, 128 + 9, b"cancelled")]
+    );
+    let late = encode_exec_payload(&Workload {
+        argv: ["/bin/sh", "-c", "exec sleep 30"]
+            .map(str::to_owned)
+            .to_vec(),
+        timeout_ms: 100,
+        cwd: None,
+        environment: WorkloadEnvironment::Default,
+    })?;
+    assert_eq!(
+        harness.request_all(44, APP_EXEC, &late),
+        vec![response(APP_EXIT, 44, 124, b"timeout")]
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert!(harness.stop().diagnostics.is_empty());
+    Ok(())
+}
+
+#[test]
+fn rooted_capture_refuses_both_kill_flags_and_leaves_the_exec_group_running() -> TestResult {
+    if super::super::tests::isolate_process_test(
+        "NVX_ROOTED_CAPTURE_REFUSAL_TEST_CHILD",
+        "guest::managed_agent::dispatch::tests::rooted_capture_refuses_both_kill_flags_and_leaves_the_exec_group_running",
+    ) {
+        return Ok(());
+    }
+    let _process = super::super::tests::PROCESS_TEST_LOCK.lock()?;
+    let (_temporary, mut system) = TestSystem::with_direct();
+    system.direct_starter = Some(super::super::seam::tests::start_as_privileged);
+    let config = AgentConfig::for_test();
+    let mappings = HostMappings::announced(0);
+    let mut harness =
+        Harness::spawn_with_capture(system, config, mappings, Some(Capture::fixture(false)));
+    harness.reset(1, 7);
+    harness.send(
+        42,
+        APP_EXEC,
+        &workload_payload(&["/bin/sh", "-c", "sleep 30 & echo \"$$ $!\"; wait"], None)?,
+    );
+    let mut output = Vec::new();
+    while !output.ends_with(b"\n") {
+        let reply = harness.next_response();
+        assert_eq!(
+            (reply.kind, reply.request_id, reply.status),
+            (APP_STDOUT, 42, 0)
+        );
+        output.extend_from_slice(&reply.payload);
+    }
+    let group: Vec<_> = std::str::from_utf8(&output)?
+        .split_whitespace()
+        .map(|id| {
+            id.parse::<i64>()
+                .map(|id| sys::ProcessId::from_positive(id).unwrap())
+        })
+        .collect::<Result<_, _>>()?;
+    assert_eq!(group.len(), 2);
+    for (request_id, kill) in [(43, 0), (44, 1)] {
+        assert_eq!(
+            harness.request_all(request_id, APP_CAPTURE, &[kill]),
+            vec![response(
+                APP_ERROR,
+                request_id,
+                Errno::ENOTSUP as i32,
+                b"unsupported-operation"
+            )]
+        );
+        let live = sys::ProcessId::live_userspace()?;
+        assert!(group.iter().all(|process| live.contains(process)));
+        harness.host.set_nonblocking(true)?;
+        assert_eq!(
+            harness.host.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        harness.host.set_nonblocking(false)?;
+    }
+    assert_eq!(
+        harness.request_all(42, APP_CANCEL, &[]),
+        vec![response(APP_EXIT, 42, 137, b"cancelled")]
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let live = sys::ProcessId::live_userspace()?;
+        if group.iter().all(|process| !live.contains(process)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cancelled process group did not exit"
+        );
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(harness.stop().diagnostics.is_empty());
+    Ok(())
+}
+
+#[test]
+fn refused_records_report_the_stage_at_which_the_c_agent_reported_them() {
+    let line =
+        |stage: &str, status: i32| format!("NVX-MANAGED-ERROR: stage={stage} status={status}\n");
+    let eproto = Errno::EPROTO as i32;
+    let outer = |record_type, instance: &[u8; 16], epoch, sequence, payload: &[u8]| {
+        encode_outer(record_type, instance, epoch, sequence, payload).unwrap()
+    };
+    let ping = frame(APP_PING, 42, &[]);
+    let mut bad_magic = outer(OUTER_DATA, &INSTANCE, 1, 8, &ping);
+    bad_magic[0] = b'X';
+    let mut oversized = outer(OUTER_DATA, &INSTANCE, 1, 8, &[]);
+    oversized[40..44].copy_from_slice(&(OUTER_MAX_PAYLOAD as u32 + 1).to_le_bytes());
+    let window = OUTER_RECEIVE_WINDOW.to_le_bytes();
+    let cases = [
+        // Headers that the C agent refused.
+        (bad_magic, line("outer-read", eproto)),
+        (oversized, line("outer-read", eproto)),
+        // Types that it does not take, whatever their payloads.
+        (outer(0, &INSTANCE, 1, 8, &[]), line("outer-type", 0)),
+        (outer(10, &INSTANCE, 1, 8, b"abc"), line("outer-type", 10)),
+        (
+            outer(OUTER_ACK, &INSTANCE, 1, 8, &window),
+            line("outer-type", i32::from(OUTER_ACK)),
+        ),
+        (
+            outer(OUTER_CREDIT, &INSTANCE, 1, 8, &[0; 4]),
+            line("outer-type", i32::from(OUTER_CREDIT)),
+        ),
+        (
+            outer(OUTER_WAIT, &INSTANCE, 1, 8, b"x"),
+            line("outer-type", i32::from(OUTER_WAIT)),
+        ),
+        (
+            outer(OUTER_GUEST_ATTACH, &INSTANCE, 1, 8, &[]),
+            line("outer-type", i32::from(OUTER_GUEST_ATTACH)),
+        ),
+        // RESET records with a payload or without an epoch.
+        (
+            outer(OUTER_RESET, &INSTANCE, 2, 0, b"x"),
+            line("reset-ack", eproto),
+        ),
+        (
+            outer(OUTER_RESET, &INSTANCE, 0, 0, &[]),
+            line("reset-ack", eproto),
+        ),
+        // DATA records without an NVXC frame, or of another instance.
+        (
+            outer(OUTER_DATA, &INSTANCE, 1, 8, &[]),
+            line("data-application", 0) + &line("data", eproto),
+        ),
+        (
+            outer(OUTER_DATA, &[8; 16], 1, 8, &ping),
+            line("data-identity", 1) + &line("data", eproto),
+        ),
+        // Faults that only the shared session refuses: a RESET without an instance ID, or of an
+        // epoch that does not advance the instance's.
+        (
+            outer(OUTER_RESET, &[0; 16], 2, 0, &[]),
+            line("reset-ack", eproto),
+        ),
+        (
+            outer(OUTER_RESET, &INSTANCE, 1, 0, &[]),
+            line("reset-ack", eproto),
+        ),
+    ];
+    for (record, expected) in cases {
+        let diagnostics = Harness::new().fail(&record);
+        let header = &record[..OUTER_HEADER_LEN];
+        assert_eq!(
+            String::from_utf8(diagnostics).unwrap(),
+            expected,
+            "{header:?}"
+        );
+    }
+}
+
+#[test]
+fn data_before_the_first_reset_is_a_type_that_the_agent_does_not_take_yet() {
+    let harness = Harness::spawn(TestSystem::new(Paths::default()), 0);
+    let frame = frame(APP_PING, 42, &[]);
+    let diagnostics = harness.fail(&encode_outer(OUTER_DATA, &INSTANCE, 1, 0, &frame).unwrap());
+    assert_eq!(
+        diagnostics,
+        format!("NVX-MANAGED-ERROR: stage=outer-type status={OUTER_DATA}\n").as_bytes()
+    );
+}
+
+#[test]
+fn data_at_the_last_sequence_number_is_out_of_sequence() {
+    // After a RESET at the second-to-last sequence number, DATA at the last one leaves none
+    // for the broker's next record.
+    let mut harness = Harness::spawn(TestSystem::new(Paths::default()), 0);
+    harness.reset(1, u64::MAX - 1);
+    let frame = frame(APP_PING, 42, &[]);
+    let record = encode_outer(OUTER_DATA, &INSTANCE, 1, u64::MAX, &frame).unwrap();
+    assert_eq!(
+        String::from_utf8(harness.fail(&record)).unwrap(),
+        format!(
+            "NVX-MANAGED-ERROR: stage=data-sequence status=-1\n\
+                 NVX-MANAGED-ERROR: stage=data status={}\n",
+            Errno::EPROTO as i32
+        )
+    );
+}
+
+#[test]
+fn a_stream_that_ends_reports_a_read_failure_inside_a_record_or_not() {
+    let expected = format!(
+        "NVX-MANAGED-ERROR: stage=outer-read status={}\n",
+        Errno::EIO as i32
+    );
+    let frame = frame(APP_PING, 42, &[]);
+    let record = encode_outer(OUTER_DATA, &INSTANCE, 1, 8, &frame).unwrap();
+    for length in [0, 20, OUTER_HEADER_LEN + 1] {
+        let diagnostics = Harness::new().close(&record[..length]);
+        assert_eq!(diagnostics, expected.as_bytes(), "after {length} bytes");
+    }
+}
+
+#[test]
+fn a_reset_between_requests_starts_a_new_epoch() {
+    let mut harness = Harness::new();
+    assert_eq!(
+        harness.request(APP_PING, &[]),
+        response(APP_READY, 42, 0, b"")
+    );
+    // A RESET of a later epoch may come at any sequence number.
+    for (epoch, sequence) in [(2, 0), (5, 11)] {
+        harness.reset(epoch, sequence);
+        assert_eq!(
+            harness.request(APP_PING, &[]),
+            response(APP_READY, 42, 0, b"")
+        );
+    }
+    let system = harness.stop();
+    assert!(system.diagnostics.is_empty());
+}
