@@ -20,14 +20,14 @@ use super::filesystem::{ExportPlan, ReservedTargets};
 use super::network::{self, NetworkPolicy};
 use super::platform::parse_hex32;
 use super::runtime::{GuestPowerAction, Hypervisor, Runtime};
-use crate::activation::{self, Journal, MAX_HOSTNAME_BYTES, OverlayMode, View};
 use crate::contract;
 use crate::error::{Error, Result};
+use crate::guest_restore;
 use crate::net::Ipv4Cidr;
 use crate::protocol::cmdline::{self, Parameter};
 use crate::protocol::maps::HostMap;
-use crate::protocol::root::{ImageFormat, RootImage, RootLayout, RootUpper};
-use crate::protocol::view;
+use crate::protocol::root::{ImageFormat, Journal, OverlayMode, RootImage, RootLayout, RootUpper};
+use crate::protocol::view::{self, MAX_HOSTNAME_BYTES, View};
 
 /// Bytes of the x86 kernel command line available to caller tokens, including the NUL.
 pub const COMMAND_LINE_BUDGET: usize = 1024;
@@ -435,7 +435,7 @@ impl VmConfig {
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) when
     /// [`check`](Self::check) refuses the configuration or when it has no [`Boot`]. A restore
-    /// receives its view through its activation record, not a kernel command line.
+    /// receives its view through its guest-restore record, not a kernel command line.
     /// A capture renders only accepted platform tokens and its boot-online processor count;
     /// OpenVMM adds the single tier token from the capture's `--snapshot-tier platform` option.
     pub fn kernel_command_line(&self) -> Result<String> {
@@ -845,7 +845,7 @@ impl VmConfig {
                 ReservedTargets::CONTAINER_ROOT
             }
         };
-        if !activation::is_hostname(&self.view.hostname) {
+        if !view::is_hostname(&self.view.hostname) {
             return Err(Error::unsupported(format!(
                 "the hostname is not 1 to {MAX_HOSTNAME_BYTES} bytes without a NUL"
             )));
@@ -1058,7 +1058,7 @@ impl CaptureConfig {
     /// settings; and of the VM, its NIC's address, which is [`DEFAULT_GUEST_NETWORK`] when the
     /// configuration names none, its console attachment, whether it exports host paths, and its
     /// boot's command line. It digests no path, nothing of a launch's options or of the view that
-    /// each clone's activation sets, no network policy, which each restore replaces, and not the
+    /// each clone's guest restore sets, no network policy, which each restore replaces, and not the
     /// VM's own processors and memory, for which the capture's count.
     pub fn identity(&self, config: &VmConfig, runtime: &Runtime) -> CaptureIdentity {
         let mut fed = Identifying(Sha256::new_with_prefix(CAPTURE_DOMAIN));
@@ -1074,7 +1074,7 @@ impl CaptureConfig {
             contract::DEVICE_STATE_SCHEMA_VERSION,
             contract::TIME_ABI_VERSION,
             contract::RESTORE_PACKET_VERSION,
-            u64::from(activation::VERSION),
+            u64::from(guest_restore::VERSION),
         ] {
             fed.number(version);
         }

@@ -4,7 +4,7 @@
 //! Run the compiled example with a backend, OpenVMM, kernel, initramfs, new VM directory, and
 //! the three artifact SHA-256 digests from their installation metadata, in that order.
 //! Append SNAPSHOT-DIR IMAGE.erofs for a restore-ready demonstration: it verifies the ready
-//! event, then intentionally stops and verifies the VM's exit without driving guest activation.
+//! event, then intentionally stops and verifies the VM's exit without driving a guest restore.
 //! The snapshot must have captured a disconnected boot console, as `nvx-rs snapshot capture`
 //! does.
 //!
@@ -33,7 +33,6 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use nvx::activation::{MachineIdMode, View};
 use nvx::host::config::{
     Boot, ConsoleAttachment, LayeredRoot, NetworkConfig, RootConfig, UpperConfig, VmConfig,
 };
@@ -43,6 +42,7 @@ use nvx::host::runtime::{ArtifactIdentity, Hypervisor, LaunchOptions, Runtime, R
 use nvx::host::transport::{self, Transport};
 use nvx::host::{report, snapshot, vm};
 use nvx::protocol::root::RootImage;
+use nvx::protocol::view::{MachineIdMode, View};
 
 /// One byte past OpenVMM's 25-byte restore-ready event, so that a longer event fails to parse.
 const READY_LIMIT: usize = 26;
@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             upper: UpperConfig::Ram {
                 max_memory_percent: 50,
             },
-            overlay: nvx::activation::OverlayMode::TrustedLowers,
+            overlay: nvx::protocol::root::OverlayMode::TrustedLowers,
         });
         config.network = snapshot.nic().map(|_| NetworkConfig {
             guest_network: None,

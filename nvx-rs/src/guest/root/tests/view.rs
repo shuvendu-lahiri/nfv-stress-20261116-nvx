@@ -1,9 +1,7 @@
 use super::*;
+use crate::ErrorKind;
 use crate::guest::view::{self as vm_view, MACHINE_ID_FILE, RESOLVER_FILE};
-use crate::{
-    ErrorKind,
-    activation::{MachineIdMode, View},
-};
+use crate::protocol::view::{MachineIdMode, View};
 use std::error::Error as _;
 
 #[test]
@@ -154,8 +152,8 @@ fn a_later_bind_failure_stays_owned_and_its_teardown_removes_the_earlier_bind() 
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn actual_resolver_failures_keep_the_network_class_and_root_owned_bind() {
-    use crate::guest::activation::ApplyError;
-    use crate::guest::activation::state::apply::NetworkError;
+    use crate::guest::restore::ApplyError;
+    use crate::guest::restore::state::apply::NetworkError;
 
     for write_failure in [false, true] {
         let (guest, mut root, _, resolver) = prepared();
