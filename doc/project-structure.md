@@ -101,18 +101,18 @@ nvx/
 |-- nvx-rs/                      The `nvx` package: NVX's library, with NVX's own programs as its binaries
 |   |-- src/
 |   |   |-- lib.rs               The crate's root, its documentation, and its public modules
-|   |   |-- protocol/            Control-console codec, NVXS session, and the guest targets that live shares may not take, shared by the host and the guest
+|   |   |-- protocol/            The host's mapping table on the wire, boot tokens, and the guest targets that live shares may not take, shared by the host and the guest; private to the crate, the control console's NVXS session and NVXC
 |   |   |-- guest_restore/       The guest-restore record of a layered root, its canonical encoding, and what Ready reports about it, shared by the host, the guest, and every adapter's framing
 |   |   |-- net/                 CIDR parsing and subtraction, and hostname and guest-network forms
 |   |   |-- gpt/                 Strict reading of GPT disks for NVX's guest programs, private to the crate
 |   |   |-- uuid.rs              UUIDs in their canonical text and in GPT's layout, shared by the host and the guest
 |   |   |-- error.rs             `nvx::Error` and its `ErrorKind`, and the crate's private `ErrorCode`
-|   |   |-- host/                Feature `host`: the runtime and its hypervisor, VMs and their configuration, snapshots, restores, the transport, process references, outcome reports, and the lowering of network postures and host export plans; private to the crate, the platform layer and what only NVX's CLI uses, such as the export planner, the sandbox launch profile, and the egress policy compiler; with feature `cli`, NVX's hidden `nvx-rs` CLI
+|   |   |-- host/                Feature `host`: the runtime and its hypervisor, VMs, their configuration and control connections, snapshots, restores, process references, outcome reports, and the lowering of network postures and host export plans; private to the crate, the platform layer and what only NVX's CLI uses, such as the export planner, the sandbox launch profile, and the egress policy compiler; with feature `cli`, NVX's hidden `nvx-rs` CLI
 |   |   |-- testing/             Feature `testing`: NVX's hidden fake OpenVMM
-|   |   |-- guest/               Feature `guest`, on Linux: the libraries on which a guest init builds, such as its NVXS session, terminal, host mappings, time ABI steps, reseed, snapshot capture, and guest restore; NVX's hidden guest programs; and NVX's guest space, private to the crate
+|   |   |-- guest/               Feature `guest`, on Linux: the libraries on which a guest init builds, such as its control connection, terminal, host mappings, time ABI steps, reseed, snapshot capture, and guest restore; NVX's hidden guest programs; and NVX's guest space, private to the crate
 |   |   `-- bin/                 One file per binary, which calls its program's hidden `main`: nvx-rs, nvx-fake-openvmm, and the ten guest binaries
 |   |-- examples/                The external-launch example, and the documented host and guest workflows, which only compile
-|   |-- tests/                   Integration tests of the CLI's scenarios, in cli/, the fake OpenVMM, the guest binaries, the NVXS session, in nvxs/, the layering of `nvx::host`, a VM's lifecycle on a hypervisor, the security checklist, and the copies of the OpenVMM submodule's data, with their fixtures and the conformance vectors of the wire formats
+|   |-- tests/                   Integration tests of the CLI's scenarios, in cli/, the fake OpenVMM, the guest binaries, the layering of `nvx::host`, a VM's lifecycle on a hypervisor, the security checklist, and the copies of the OpenVMM submodule's data, with their fixtures and the conformance vectors of the wire formats
 |   |-- public-api/              The crate's public API on Linux and on Windows, which CI checks
 |   |-- Cargo.toml               Package manifest: features, binaries, examples, and the `guest` profile
 |   |-- Cargo.lock               The package's own lockfile

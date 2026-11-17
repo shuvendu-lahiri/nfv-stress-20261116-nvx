@@ -610,9 +610,9 @@ its gateway and no other destination, sandboxes whose overlay upper is a
 tmpfs in guest memory, with no scratch image, and sandboxes whose root is a
 GPT disk, over either upper, so that the three backends run the CLI's twelve
 cold cells (see the [case matrix](acceptance-case-matrix.md#cold-boots)). The
-public `vm-lifecycle` scenario then creates, spawns, reattaches to, and stops
-a VM through the public API of `nvx`. The public `snapshot-core` and
-`snapshot-tiers` scenarios capture a named snapshot with
+public `vm-lifecycle` scenario then creates, spawns, connects to, attaches to
+again, and stops a VM through the public API of `nvx`. The public
+`snapshot-core` and `snapshot-tiers` scenarios capture a named snapshot with
 `nvx-rs snapshot capture`, with nvx-init as the guest, and restore it with
 `snapshot restore` and `run --restore-snapshot` (see
 [Run](run.md#named-snapshots)): restores of each image format over each upper,
@@ -865,7 +865,7 @@ operating system hands it, as described above.
 Each also runs the ignored `nvx-rs` test `tests/openvmm_vectors.rs`, which
 compares the submodule's control-session protocol vectors, and the lines of its
 platform allowlist of kernel command-line tokens, with the copies that the
-tests of `nvx::protocol::nvxs` and `nvx::host::config` read in the `nvx-rs`
+tests of the crate's NVXS session and of `nvx::host::config` read in the `nvx-rs`
 job, which cannot check out
 OpenVMM, the versions of OpenVMM's snapshot format, time ABI, and restore
 packet with those that the sources of `nvx-rs` define, and the bound of

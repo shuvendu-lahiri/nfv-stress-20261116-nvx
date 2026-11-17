@@ -56,6 +56,19 @@ changed item to its replacement, or to what its caller now does.
   as a fourth argument, and `IdentityPart::Compatibility` replaces
   `BootContract`, `ControlContract` and `ControlSession`.
   `RuntimeIdentity::check` and `SnapshotKey::speaks_current_contracts` are gone.
+- **One control connection.** `nvx::host::nvxs`, `nvx::host::transport`, and
+  `nvx::guest::nvxs` are private, and so is the NVXS session that they speak:
+  `nvx::protocol::nvxs`, and `nvx::protocol`'s `CAPABILITY_LEN`, `OUTER_*`
+  constants, `OuterHeader`, `encode_outer`, and `decode_outer_header`. The
+  codecs of the payloads of acknowledgements and credits are gone.
+  `nvx::host::vm::Launched::connect` and
+  `nvx::host::vm::attach`, which replaces `vm::reattach`, open a
+  `vm::Connection`: an authenticated, ordered stream of bytes, whose
+  `ConnectionError` tells a timeout, an exit, and a lost session apart.
+  `vm::Console` reads and writes a VM's boot console. In the guest,
+  `nvx::guest::control::Connection` is the other end: it reports the session's
+  resets, which the guest acknowledges, and carries the bytes, with its flow
+  control inside.
 - **Errors.** `ErrorCode` and `Error`'s constructors are private: callers tell
   errors apart by their `ErrorKind`, which gains `RuntimeMismatch` and
   `StillRunning`.
