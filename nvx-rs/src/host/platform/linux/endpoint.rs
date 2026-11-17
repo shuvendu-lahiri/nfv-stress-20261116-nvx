@@ -1,0 +1,398 @@
+//! The Unix sockets of OpenVMM's endpoints: its control endpoint and the transport over it, and
+//! the listener of a restore-ready event.
+
+use std::fs::{self, File, Permissions};
+use std::io::{self, Read};
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+#[cfg(feature = "cli")]
+use std::thread;
+use std::time::{Duration, Instant};
+
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::sys::socket::{MsgFlags, getsockopt, recv, sockopt::PeerPidfd};
+
+use crate::host::platform::{Transport, TransportHandle, time_left};
+use crate::host::sys;
+
+/// The listener at which a restore awaits the restore-ready event of its VMM: a Unix
+/// socket, which the VMM connects to once, and which queues its connection until the host
+/// accepts it, then the connection that the host accepted, from which it reads the event.
+#[derive(Debug)]
+pub(crate) struct ReadyListener {
+    /// The listening socket, which the VMM finds as long as it is open.
+    socket: UnixListener,
+    /// The VMM's connection, once the host accepted it.
+    connection: Option<UnixStream>,
+}
+
+/// Listens at the Unix socket `socket_path`, in place of a socket that an earlier launch left
+/// there, as the restore-ready endpoint of a restore, and returns the endpoint, as
+/// OpenVMM's `--restore-ready-path` takes it, and its listener. The socket has mode 0600,
+/// whatever the umask, as [`set_ready_socket_mode`] gives it.
+pub(crate) fn listen_ready(socket_path: &Path) -> io::Result<(String, ReadyListener)> {
+    let endpoint = socket_path
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other("restore-ready socket path is not valid UTF-8"))?;
+    match fs::remove_file(socket_path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let socket = UnixListener::bind(socket_path)?;
+    // The umask may clear bits of the mode that the bind gives the socket, even its owner's
+    // permission to write it, without which a VMM that is not root cannot connect: the mode is
+    // set again before any VMM may connect.
+    set_ready_socket_mode(socket_path)?;
+    // The host polls the socket before it accepts, so an accept never blocks.
+    socket.set_nonblocking(true)?;
+    let listener = ReadyListener {
+        socket,
+        connection: None,
+    };
+    Ok((endpoint, listener))
+}
+
+impl ReadyListener {
+    /// Transfers the listening socket only while no receive has accepted a client.
+    pub(crate) fn into_std(self) -> io::Result<UnixListener> {
+        if self.connection.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the restore-ready listener already accepted a client",
+            ));
+        }
+        Ok(self.socket)
+    }
+
+    /// Waits at most `timeout` for what the VMM, the process `pid`, sends to the endpoint, and
+    /// appends it to `received`, which then holds at most `limit` bytes. Returns whether more may
+    /// arrive: `false` once the VMM closed its end of the connection.
+    ///
+    /// The endpoint's first connection must be the VMM's: one of another process fails with
+    /// [`io::ErrorKind::PermissionDenied`]. It receives only from the original socket peer while
+    /// it still runs, never from a cached numeric PID that a later process reused. Requires
+    /// Linux's `SO_PEERPIDFD`.
+    pub(crate) fn receive_verified(
+        &mut self,
+        pid: u32,
+        received: &mut Vec<u8>,
+        limit: usize,
+        timeout: Duration,
+    ) -> io::Result<bool> {
+        self.receive_checked(pid, received, limit, timeout, true)
+    }
+
+    /// Shares the byte/deadline receive path, verifying the original peer only when requested.
+    fn receive_checked(
+        &mut self,
+        pid: u32,
+        received: &mut Vec<u8>,
+        limit: usize,
+        timeout: Duration,
+        verify_original_peer: bool,
+    ) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        if self.connection.is_none() {
+            if !sys::wait_readable(&self.socket, timeout)? {
+                return Ok(true);
+            }
+            let connection = match self.socket.accept() {
+                Ok((connection, _)) => connection,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Ok(true);
+                }
+                Err(error) => return Err(error),
+            };
+            let peer = sys::peer_pid(&connection)?;
+            if peer != pid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "process {peer} connected to the restore-ready endpoint, not the VMM, \
+                         process {pid}"
+                    ),
+                ));
+            }
+            if verify_original_peer {
+                check_original_peer(&connection, false)?;
+            }
+            connection.set_nonblocking(true)?;
+            self.connection = Some(connection);
+        }
+        let connection = self
+            .connection
+            .as_mut()
+            .expect("the host accepted the VMM's connection");
+        let mut buffer = [0; 64];
+        let room = limit.saturating_sub(received.len()).min(buffer.len());
+        if room == 0
+            || !sys::wait_readable(
+                connection,
+                deadline.saturating_duration_since(Instant::now()),
+            )?
+        {
+            return Ok(true);
+        }
+        match connection.read(&mut buffer[..room]) {
+            Ok(0) => Ok(false),
+            Ok(count) => {
+                received.extend_from_slice(&buffer[..count]);
+                Ok(true)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// The kernel returns a descriptor of the socket's original peer, not a new lookup of its PID.
+///
+/// A peer that has exited is refused, unless `accept_unreaped` accepts one that has not been
+/// reaped, which still holds its ID, as `connect_child_endpoint` requires.
+fn check_original_peer(connection: &UnixStream, accept_unreaped: bool) -> io::Result<()> {
+    let peer = match getsockopt(connection, PeerPidfd) {
+        Err(
+            sys::Errno::ENOPROTOOPT
+            | sys::Errno::EOPNOTSUPP
+            | sys::Errno::ENOSYS
+            | sys::Errno::EPERM
+            | sys::Errno::EACCES,
+        ) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "socket peer authentication requires SO_PEERPIDFD",
+            ));
+        }
+        // Before Linux 6.16, a reaped peer yields EINVAL rather than a readable pidfd.
+        Err(sys::Errno::EINVAL | sys::Errno::ESRCH | sys::Errno::ENODATA) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the original socket peer exited",
+            ));
+        }
+        result => result?,
+    };
+    let mut descriptors = [PollFd::new(peer.as_fd(), PollFlags::POLLIN)];
+    if poll(&mut descriptors, PollTimeout::ZERO)? == 0 {
+        return Ok(());
+    }
+    let events = descriptors[0].revents().unwrap_or(PollFlags::empty());
+    if events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+        if accept_unreaped && sys::PidFd::from(peer).holds_its_id()? {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the original socket peer exited",
+        ));
+    }
+    Err(io::Error::other(format!(
+        "the socket peer pidfd reported unexpected events {events:?}"
+    )))
+}
+
+/// Gives the restore-ready socket at `socket_path`, which the caller bound, the mode 0600, whatever
+/// the umask: its owner, the user of the VMM, may connect to it, which takes the
+/// permission to write it, and no one else may.
+///
+/// The socket is opened only to locate it, following no link at its name, and refused unless it
+/// is a socket.
+fn set_ready_socket_mode(socket_path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+
+    // `nix` passes the flags on as they are, where `OpenOptionsExt::custom_flags` masks out the
+    // bits of `O_ACCMODE`, which on musl include `O_PATH`: a musl build would open the socket
+    // itself, which the kernel refuses with `ENXIO`.
+    let socket = File::from(nix::fcntl::open(
+        socket_path,
+        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?);
+    if !socket.metadata()?.file_type().is_socket() {
+        return Err(io::Error::other(format!(
+            "{} is not the restore-ready socket that the launch bound",
+            socket_path.display()
+        )));
+    }
+    // A descriptor that only locates the socket cannot change its mode itself, but its link in
+    // /proc names exactly the socket that it opened.
+    fs::set_permissions(
+        Path::new("/proc/self/fd").join(socket.as_raw_fd().to_string()),
+        Permissions::from_mode(0o600),
+    )
+}
+
+/// Connects to a control endpoint served by the process `expected_pid`.
+///
+/// Requires a live original socket peer through `SO_PEERPIDFD`, not just its cached numeric PID.
+///
+/// The connection attempt never blocks: a listener whose backlog is full yields
+/// [`io::ErrorKind::WouldBlock`], and the caller retries within its deadline.
+pub(crate) fn connect_endpoint(
+    endpoint: &str,
+    expected_pid: u32,
+    _timeout: Duration,
+) -> io::Result<Box<dyn Transport>> {
+    connect_peer(endpoint, expected_pid, false)
+}
+
+/// Connects to the endpoint that the process `child` serves, as [`connect_endpoint`] does, for a
+/// caller that launched `child` and has not reaped it: a cold run, whose OpenVMM may write its
+/// boot console's output and exit before the run checks the console's peer.
+///
+/// It accepts an original socket peer that has exited but has not been reaped, and still refuses
+/// a reaped one. That is safe because the caller's own unreaped child keeps its PID, which no
+/// other process can reuse until the caller reaps it, so a peer that holds the child's PID is the
+/// child. Every other connection, as [`connect_endpoint`]'s, still refuses an exited peer.
+#[cfg(feature = "cli")]
+pub(crate) fn connect_child_endpoint(endpoint: &str, child: u32) -> io::Result<Box<dyn Transport>> {
+    connect_peer(endpoint, child, true)
+}
+
+/// Connects to the endpoint that the process `expected_pid` serves as the socket's original peer,
+/// which [`check_original_peer`] checks, with `accept_unreaped`.
+fn connect_peer(
+    endpoint: &str,
+    expected_pid: u32,
+    accept_unreaped: bool,
+) -> io::Result<Box<dyn Transport>> {
+    let stream = sys::connect_nonblocking(endpoint)?;
+    let peer = sys::peer_pid(&stream)?;
+    if peer != expected_pid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "control endpoint is served by process {peer}, not OpenVMM process {expected_pid}"
+            ),
+        ));
+    }
+    check_original_peer(&stream, accept_unreaped)?;
+    transport_from_handle(stream.into())
+}
+
+/// Adapts an owned duplicate of an already verified connection without changing its blocking mode.
+pub(crate) fn transport_from_handle(handle: TransportHandle) -> io::Result<Box<dyn Transport>> {
+    Ok(Box::new(UnixTransport {
+        stream: UnixStream::from(handle),
+    }))
+}
+
+/// Ends the pending and later transfers of the connection that `handle` duplicates, by shutting
+/// the socket down in both directions: a read then ends the stream, and a write fails.
+#[cfg(feature = "cli")]
+pub(crate) fn interrupt_transfers(handle: &TransportHandle) -> io::Result<()> {
+    match nix::sys::socket::shutdown(handle.as_raw_fd(), nix::sys::socket::Shutdown::Both) {
+        Ok(()) | Err(sys::Errno::ENOTCONN) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Looks up the endpoint owner within the caller's absolute deadline.
+#[cfg(feature = "cli")]
+pub(crate) fn endpoint_server_pid_until(
+    endpoint: &str,
+    deadline: Instant,
+) -> io::Result<Option<u32>> {
+    loop {
+        time_left(Some(deadline))?;
+        match sys::connect_nonblocking(endpoint) {
+            Ok(stream) => return sys::peer_pid(&stream).map(Some),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(None);
+            }
+            // A full listen backlog drains as OpenVMM accepts clients.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let left = time_left(Some(deadline))?.expect("the probe has a deadline");
+                thread::sleep(left.min(Duration::from_millis(25)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Blocking Unix-domain stream adapted to the control transport's deadline API.
+pub(super) struct UnixTransport {
+    /// Connected stream to OpenVMM's control socket.
+    pub(super) stream: UnixStream,
+}
+
+/// Clamps a present socket timeout to the nonzero duration accepted by `std`.
+fn socket_timeout(timeout: Option<Duration>) -> Option<Duration> {
+    timeout.map(|timeout| timeout.max(Duration::from_millis(1)))
+}
+
+/// Normalizes socket would-block and timeout errors to [`io::ErrorKind::TimedOut`].
+fn map_timeout(error: io::Error) -> io::Error {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) {
+        io::ErrorKind::TimedOut.into()
+    } else {
+        error
+    }
+}
+
+impl Transport for UnixTransport {
+    fn try_clone_handle(&self) -> io::Result<Option<TransportHandle>> {
+        self.stream.try_clone().map(|stream| Some(stream.into()))
+    }
+
+    fn read(&mut self, buffer: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
+        if timeout == Some(Duration::ZERO) {
+            return match recv(self.stream.as_raw_fd(), buffer, MsgFlags::MSG_DONTWAIT) {
+                Err(nix::errno::Errno::EINTR) => Err(io::ErrorKind::TimedOut.into()),
+                result => result.map_err(io::Error::from).map_err(map_timeout),
+            };
+        }
+        self.stream.set_read_timeout(socket_timeout(timeout))?;
+        loop {
+            match self.stream.read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result.map_err(map_timeout),
+            }
+        }
+    }
+
+    fn write_all(&mut self, mut data: &[u8], timeout: Option<Duration>) -> io::Result<()> {
+        // A blocking send restarts its timeout whenever the endpoint makes room, so one that
+        // drains slowly would hold the write past `timeout`. Sends therefore never wait, and
+        // polls wait for room within what is left of `timeout`.
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        while !data.is_empty() {
+            let left = time_left(deadline)?;
+            match sys::send_nonblocking(&self.stream, data)? {
+                0 => sys::wait_writable(&self.stream, left)?,
+                sent => data = &data[sent..],
+            }
+        }
+        Ok(())
+    }
+
+    fn unread(&self) -> io::Result<Option<usize>> {
+        sys::unread_by_peer(&self.stream).map(Some)
+    }
+}
