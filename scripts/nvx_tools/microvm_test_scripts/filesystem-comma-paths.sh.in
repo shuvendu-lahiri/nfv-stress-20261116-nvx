@@ -1,0 +1,64 @@
+set -eu
+fail() {
+    code="$1"
+    echo "NVX-FILESYSTEM-COMMA-PATHS-FAIL code=$code"
+    nvx-exit "$code"
+    exit "$code"
+}
+
+expect_read_only() {
+    case "$1" in
+        *'Read-only file system'*) ;;
+        *)
+            echo "NVX-FILESYSTEM-COMMA-PATHS-ERROR $1"
+            fail "$2"
+            ;;
+    esac
+}
+
+# The checked export plan always uses an aggregate, even for one bind.
+aggregate=/run/nvx/hostfs/root
+export_mode=@EXPORT_MODE@
+grep -q "virtfs_dir=$aggregate virtfs_tag=microvm virtfs_mode=$export_mode virtfs_aggregate=1" /proc/cmdline || fail 10
+
+# Each TARGET:MODE:SEED names a share's guest target, its mode, and the
+# contents of its seed file.
+code=20
+for share in @SHARES@; do
+    target=${share%%:*}
+    rest=${share#*:}
+    mode=${rest%%:*}
+    seed=${rest#*:}
+    grep -q "^microvm $target virtiofs $mode," /proc/mounts || fail "$code"
+    # The target shows the exact host directory, rather than the one beside
+    # it that the text before the last comma of its host path names.
+    [ "$(cat "$target/seed")" = "$seed" ] || fail $((code + 1))
+    # Its denied subdirectory stays hidden: the share lists only its seed.
+    [ "$(find "$target" -mindepth 1 -maxdepth 1)" = "$target/seed" ] || fail $((code + 2))
+    if cat "$target/secret/token" >/dev/null 2>&1; then
+        fail $((code + 3))
+    fi
+    if [ "$mode" = rw ]; then
+        printf 'NVX-GUEST-WRITE\n' >"$target/from-guest" || fail $((code + 4))
+    else
+        if error=$(touch "$target/from-guest" 2>&1); then
+            fail $((code + 5))
+        fi
+        expect_read_only "$error" $((code + 6))
+        # OpenVMM enforces the mode on the host, so the share refuses writes
+        # even after guest root makes its mount read-write.
+        if [ "$export_mode" = ro ]; then
+            mount -o remount,rw "$aggregate" || fail $((code + 7))
+        fi
+        mount -o remount,bind,rw "$target" || fail $((code + 7))
+        grep -q "^microvm $target virtiofs rw," /proc/mounts || fail $((code + 8))
+        if error=$(touch "$target/from-guest" 2>&1); then
+            fail $((code + 9))
+        fi
+        expect_read_only "$error" $((code + 10))
+    fi
+    code=$((code + 20))
+done
+
+echo NVX-FILESYSTEM-COMMA-PATHS-OK
+nvx-exit 0
