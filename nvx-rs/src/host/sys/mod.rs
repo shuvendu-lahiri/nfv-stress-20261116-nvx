@@ -1,0 +1,39 @@
+//! Safe operating-system interface of Unix hosts.
+//!
+//! The other host modules deny unsafe code. On Unix, they reach the operating system through the
+//! standard library or this module, which makes its system calls through `nix` and confines the
+//! unsafe ones behind wrappers that establish their ownership and async-signal-safety invariants.
+//! `nix` has no wrapper for `pidfd_open`, `pidfd_send_signal`, `close_range`, or `getdents64`, and
+//! wraps `renameat2` only for glibc, so those go through `nix`'s re-export of libc, as does the
+//! query of the `SIGINT` disposition that precedes the CLI's handler, and `umask`, whose `nix`
+//! wrapper panics when a seccomp policy makes the call fail. The seccomp filters of the tests go
+//! through libc's `prctl` too, since `nix` does not wrap seccomp. The Windows platform module
+//! still calls `windows-sys` directly.
+
+#[cfg(all(feature = "cli", target_os = "linux"))]
+mod fs;
+#[cfg(feature = "cli")]
+mod interrupt;
+#[cfg(target_os = "linux")]
+mod process;
+#[cfg(target_os = "linux")]
+mod socket;
+
+#[cfg(target_os = "linux")]
+pub(crate) use nix::errno::Errno;
+
+#[cfg(all(feature = "cli", target_os = "linux"))]
+pub(crate) use fs::rename_no_replace;
+#[cfg(feature = "cli")]
+pub(crate) use interrupt::{interrupted, watch_interrupts, write_interruptibly};
+#[cfg(all(feature = "cli", target_os = "linux"))]
+pub(crate) use process::inherit_only;
+#[cfg(target_os = "linux")]
+pub(crate) use process::{LAST_STANDARD_STREAM, PidFd, detach, process_exists};
+#[cfg(target_os = "linux")]
+pub(crate) use socket::{
+    connect_nonblocking, peer_pid, send_nonblocking, wait_readable, wait_writable,
+};
+
+#[cfg(test)]
+pub(crate) mod tests;

@@ -1,0 +1,79 @@
+set -eu
+fail() {
+    echo "NVX-UNTIERED-NETWORK-FAIL $1"
+    exit "$2"
+}
+# The number of the host's exchanges with the server below, through each way
+# in that the restore's policy gives the host.
+exchanges=$1
+case "$exchanges" in
+'' | *[!0-9]*) fail "exchanges $exchanges" 84 ;;
+esac
+# The nameservers of the guest's resolver, which the restore's activation
+# names when the restore's policy has a DNS server.
+resolver=$(awk '$1 == "nameserver" { list = list sep $2; sep = "," }
+    END { print (list == "" ? "none" : list) }' /etc/resolv.conf 2>/dev/null) ||
+    resolver=none
+# The activation starts the announcer of the guest's listeners when the
+# restore's policy publishes them.
+if busybox pidof nvx-ingress >/dev/null; then
+    announcer=running
+else
+    announcer=none
+fi
+# Sets result to whether the guest reached the host service that answers $1
+# at port $2 of the gateway, which the endpoint maps to host loopback.
+probe() {
+    if answer=$(wget -T @PROBE_TIMEOUT@ -qO- "http://@GATEWAY_IPV4@:$2/$1" 2>/dev/null); then
+        [ "$answer" = "NVX-PLATFORM-NETWORK-$1" ] || fail "unexpected $1 answer" 81
+        result=reached
+    else
+        result=denied
+    fi
+}
+probe allowed @ALLOWED_PORT@
+allowed=$result
+probe other @OTHER_PORT@
+other=$result
+echo "NVX-UNTIERED-NETWORK-REPORT resolver=$resolver announcer=$announcer allowed=$allowed other=$other"
+# The guest's TCP server answers the host, one client at a time, each of which
+# it waits for up to @CLIENT_TIMEOUT@ seconds, and keeps the line that each
+# sends. Without a client, it listens on while the host checks that nothing
+# publishes its port.
+inbound=$(mktemp -d) || fail "no directory for the inbound lines" 87
+if [ "$exchanges" -eq 0 ]; then
+    busybox nc -l -p @GUEST_PORT@ </dev/null >/dev/null 2>&1 &
+else
+    (
+        client=0
+        while [ "$client" -lt "$exchanges" ]; do
+            printf 'NVX-HOST-LOOPBACK-TCP-ACK\n' |
+                busybox nc -l -p @GUEST_PORT@ -w @CLIENT_TIMEOUT@ \
+                    >"$inbound/$client" 2>/dev/null || true
+            client=$((client + 1))
+        done
+    ) </dev/null >/dev/null 2>&1 &
+fi
+server=$!
+port_hex=$(printf '%04X' @GUEST_PORT@)
+tries=0
+while ! awk -v pattern=":$port_hex\$" \
+    '$2 ~ pattern && $4 == "0A" { found = 1 } END { exit !found }' \
+    /proc/net/tcp /proc/net/tcp6; do
+    [ "$tries" -lt 100 ] || fail "the TCP server did not listen" 82
+    tries=$((tries + 1))
+    sleep 0.05
+done
+echo NVX-UNTIERED-NETWORK-LISTENING
+if [ "$exchanges" -eq 0 ]; then
+    sleep @HOLD_SECONDS@
+    kill "$server" 2>/dev/null || true
+fi
+wait "$server" || true
+client=0
+while [ "$client" -lt "$exchanges" ]; do
+    grep -qx NVX-HOST-LOOPBACK-INBOUND "$inbound/$client" ||
+        fail "client $client sent no line" 86
+    client=$((client + 1))
+done
+echo "NVX-UNTIERED-NETWORK-INBOUND $exchanges"
