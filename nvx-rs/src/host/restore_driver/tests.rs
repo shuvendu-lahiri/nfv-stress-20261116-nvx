@@ -5,14 +5,16 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::*;
-use crate::activation::{
-    Configuration, ExpectedResources, Export, ExportKind, Image, MachineIdMode, OverlayMode,
-    ReadyActivation, RestoreSection, TransactionId, Upper, View,
+use crate::guest_restore::{
+    Configuration, ExpectedResources, Export, ExportKind, GuestRestoreReady, Image, RestoreSection,
+    TransactionId, Upper,
 };
 use crate::host::process::Opened;
 use crate::host::session::ExecEvent;
 use crate::protocol::WorkloadEnvironment;
+use crate::protocol::root::OverlayMode;
 use crate::protocol::v2::Outcome;
+use crate::protocol::view::{MachineIdMode, View};
 
 /// A stand-in for OpenVMM and its guest, which serves the control endpoint, sends the
 /// restore-ready event, attaches the host with the capability of its standard input, and answers
@@ -152,8 +154,8 @@ fn python() -> PathBuf {
         .expect("Python is on PATH")
 }
 
-fn record() -> ActivationRecord {
-    ActivationRecord::new(
+fn record() -> GuestRestoreRecord {
+    GuestRestoreRecord::new(
         Some(RestoreSection {
             transaction: TransactionId::from_bytes([1; 16]),
         }),
@@ -273,7 +275,7 @@ struct Peer {
 impl Peer {
     fn start(case: &str) -> Self {
         let vm = Vm::spawn(true, |directory, outputs, ready| {
-            let activation = hex(&ReadyActivation::of(&record()).encode());
+            let activation = hex(&GuestRestoreReady::of(&record()).encode());
             ["-c", PEER, case, &outputs.endpoint, ready]
                 .map(OsString::from)
                 .into_iter()
@@ -643,7 +645,7 @@ fn mapping_and_start_failures_are_told_apart_from_the_machines() {
     let mut configuration = record().configuration().clone();
     configuration.export = None;
     configuration.mappings = 0;
-    let record = ActivationRecord::new(record().restore().cloned(), configuration).unwrap();
+    let record = GuestRestoreRecord::new(record().restore().cloned(), configuration).unwrap();
     let mut peer = Peer::start("reconnect");
     // The session stays open until the peer answered its Start.
     let _session = restore(
@@ -660,7 +662,7 @@ fn mapping_and_start_failures_are_told_apart_from_the_machines() {
 
 #[test]
 fn a_cold_record_and_a_root_workload_fail_before_the_vm_is_contacted() {
-    let cold = ActivationRecord::new(None, record().configuration().clone()).unwrap();
+    let cold = GuestRestoreRecord::new(None, record().configuration().clone()).unwrap();
     let mut root = workload();
     root.identity = WorkloadIdentity {
         uid: 0,

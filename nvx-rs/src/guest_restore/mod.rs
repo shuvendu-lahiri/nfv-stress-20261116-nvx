@@ -1,21 +1,21 @@
-//! The activation record of a layered root: one bounded, versioned, non-secret record of the
-//! settings that a root's activation applies, and what Ready reports about that activation, which
-//! the host, the guest, and every adapter's framing share.
+//! The guest-restore record of a layered root: one bounded, versioned, non-secret record of the
+//! settings that a root's guest restore applies, and what Ready reports about that guest restore,
+//! which the host, the guest, and every adapter's framing share.
 //!
 //! A layered root's guest assembles its root and enters its workload with settings that the host
 //! chooses for each launch. A clone that the host restores from a template keeps the template's
 //! captured configuration, so its record gives it the settings of its own launch: everything that
 //! it needs to activate. A cold boot's record holds the settings that its guest applied, in the
-//! same form, and every layered root reports its activation in Ready in the same way:
+//! same form, and every layered root reports its guest restore in Ready in the same way:
 //!
-//! - [`ActivationRecord`]: the [`VERSION`] of its schema, the [`RestoreSection`] of a clone, and
+//! - [`GuestRestoreRecord`]: the [`VERSION`] of its schema, the [`RestoreSection`] of a clone, and
 //!   the [`Configuration`]. A clone's restore section holds the restore's [`TransactionId`], 16
 //!   random bytes that the host picks for each restore and keeps across the restore's retries.
 //!   A cold boot's record has no restore section.
-//! - [`Configuration`]: the non-secret settings that the activation applies, which the
+//! - [`Configuration`]: the non-secret settings that the guest restore applies, which the
 //!   [configuration](#configuration) lists.
-//! - [`ReadyActivation`]: what Ready reports about the activation: that it applied, which every
-//!   layered root reports, and the transaction ID, which only a clone reports.
+//! - [`GuestRestoreReady`]: what Ready reports about the guest restore: that it applied, which
+//!   every layered root reports, and the transaction ID, which only a clone reports.
 //!
 //! The [guest-agent guidelines] give the order in which an init completes a restore before Ready:
 //! it applies the record, with this restore's own network policy, mounts the runtime's file
@@ -24,10 +24,10 @@
 //!
 //! [guest-agent guidelines]: https://github.com/microsoft/nvx/blob/dev/doc/guest-agent-guidelines.md
 //!
-//! [`ActivationRecord::new`] admits a configuration only once [`Configuration::check`] finds that
+//! [`GuestRestoreRecord::new`] admits a configuration only once [`Configuration::check`] finds that
 //! it keeps every [limit](#limits), so that every record holds settings that a guest can apply.
-//! [`ActivationRecord::encode`] writes a record's canonical [encoding](#encoding), and
-//! [`ActivationRecord::decode`] reads it back, by the same rules, and [`ReadyActivation`] has a
+//! [`GuestRestoreRecord::encode`] writes a record's canonical [encoding](#encoding), and
+//! [`GuestRestoreRecord::decode`] reads it back, by the same rules, and [`GuestRestoreReady`] has a
 //! canonical [encoding](#ready) of its own. The module depends on nothing outside the standard
 //! library and the crate's `protocol` and `uuid` modules, so it builds without features, and the
 //! host, the guest, and every adapter's framing share it.
@@ -47,11 +47,15 @@
 //!   [`Publication`] of the workload's listeners, and the endpoint of its proxy, if any, which
 //!   holds no credentials;
 //! - the [`View`]: the hostname and the [`MachineIdMode`], the image's own machine ID or one that
-//!   the guest generates. Each execution names its own identity;
-//! - the root's settings: the [`OverlayMode`], the [`Journal`] policy of a scratch upper, and the
-//!   bound of a GPT disk's first partition;
+//!   the guest generates. Each execution names its own identity. A cold boot's view is the same
+//!   [`View`], which [`protocol::view`](crate::protocol::view) defines for both;
+//! - the root's settings: the [`OverlayMode`], the [`Journal`] policy of a scratch upper, which
+//!   [`protocol::root`](crate::protocol::root) defines for cold boots too, and the bound of a GPT
+//!   disk's first partition;
 //! - the [`ExpectedResources`]: the CPU count and the memory size that the guest must have, as a
 //!   clone's repair produces them.
+//!
+//! [`MachineIdMode`]: crate::protocol::view::MachineIdMode
 //!
 //! The guest takes the other inputs of its root's assembly from its own configuration, which a
 //! template captures, so that they are invariants of the template: the runtime directory, the
@@ -99,7 +103,7 @@
 //! Integers are little-endian, and identities, IDs, and addresses are their bytes, in order. The
 //! largest record, with every field at its largest, holds 424 bytes.
 //!
-//! [`ActivationRecord::decode`] refuses bytes that are longer than [`MAX_RECORD_BYTES`], end
+//! [`GuestRestoreRecord::decode`] refuses bytes that are longer than [`MAX_RECORD_BYTES`], end
 //! inside the version or a field, or hold another version; a field with an unknown tag, a
 //! repeated field, and a field out of order; a value with another number of bytes than its
 //! contents take, or with a code that the version does not define; a mapping count of 0, since
@@ -107,31 +111,33 @@
 //! present, or with a DNS server or a proxy but
 //! no network; and every configuration that [`Configuration::check`] refuses, such as one with
 //! an export without mappings, or with mappings without an export. A record therefore has
-//! exactly one encoding, which [`ActivationRecord::encode`] writes, and which the decoder reads
+//! exactly one encoding, which [`GuestRestoreRecord::encode`] writes, and which the decoder reads
 //! back to the same record.
 //!
 //! # Ready
 //!
-//! A guest reports Ready once its activation has applied its record, and
-//! [`ReadyActivation::of`] returns what that Ready reports about the activation: a clone's
+//! A guest reports Ready once its guest restore has applied its record, and
+//! [`GuestRestoreReady::of`] returns what that Ready reports about the guest restore: a clone's
 //! transaction ID, and nothing more for a cold boot. The transaction ID ties a clone's Ready to
 //! the record of its restore, since the host picks a new transaction ID for each restore and
 //! sends no other record under it. What Ready reports has a canonical encoding, which
-//! [`ReadyActivation::encode`] writes and [`ReadyActivation::decode`] reads back: `0` for a cold
-//! boot, or `1` and the clone's 16-byte transaction ID, [`ReadyActivation::COLD_LEN`] or
-//! [`ReadyActivation::CLONE_LEN`] bytes. A Ready that embeds these bytes therefore has the same
+//! [`GuestRestoreReady::encode`] writes and [`GuestRestoreReady::decode`] reads back: `0` for a
+//! cold boot, or `1` and the clone's 16-byte transaction ID, [`GuestRestoreReady::COLD_LEN`] or
+//! [`GuestRestoreReady::CLONE_LEN`] bytes. A Ready that embeds these bytes therefore has the same
 //! encoding for a clone as for a cold boot.
 //!
 //! The conformance vectors of `tests/vectors/activation-v2.txt` hold records, and what Ready
-//! reports about their activations, in both encodings, and bytes that every decoder refuses.
+//! reports about their guest restores, in both encodings, and bytes that every decoder refuses.
 //!
 //! # Example
 //!
 //! ```
-//! use nvx::activation::{
-//!     ActivationRecord, Configuration, ExpectedResources, Image, MachineIdMode,
-//!     OverlayMode, RestoreSection, TransactionId, Upper, View,
+//! use nvx::guest_restore::{
+//!     GuestRestoreRecord, Configuration, ExpectedResources, Image, RestoreSection, TransactionId,
+//!     Upper,
 //! };
+//! use nvx::protocol::root::OverlayMode;
+//! use nvx::protocol::view::{MachineIdMode, View};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let configuration = Configuration {
@@ -150,17 +156,17 @@
 //!     resources: ExpectedResources { cpus: 2, memory: 1 << 30 },
 //! };
 //! // A cold boot's record has no restore section.
-//! let cold = ActivationRecord::new(None, configuration.clone())?;
+//! let cold = GuestRestoreRecord::new(None, configuration.clone())?;
 //! assert!(cold.restore().is_none());
 //! // A clone's names only its restore's transaction.
 //! let restore = RestoreSection {
 //!     transaction: TransactionId::from_bytes([0x22; 16]),
 //! };
-//! let clone = ActivationRecord::new(Some(restore), configuration)?;
+//! let clone = GuestRestoreRecord::new(Some(restore), configuration)?;
 //! assert_eq!(clone.restore(), Some(&restore));
 //! // Its canonical encoding reads back to it.
 //! let bytes = clone.encode();
-//! assert_eq!(ActivationRecord::decode(&bytes)?, clone);
+//! assert_eq!(GuestRestoreRecord::decode(&bytes)?, clone);
 //! # Ok(())
 //! # }
 //! ```
@@ -169,7 +175,8 @@ use std::fmt;
 use std::net::IpAddr;
 
 use crate::protocol::MAX_HOST_MAPPINGS;
-use crate::protocol::root::ImageFormat;
+use crate::protocol::root::{ImageFormat, Journal, OverlayMode};
+use crate::protocol::view::{MAX_HOSTNAME_BYTES, View, is_hostname};
 use crate::uuid::Uuid;
 
 mod codec;
@@ -179,8 +186,8 @@ mod tests;
 
 pub use self::codec::Field;
 
-/// The version of the activation contract that this build speaks: the schema of an
-/// [`ActivationRecord`], which every record names. A record of another version is refused.
+/// The version of the guest-restore contract that this build speaks: the schema of an
+/// [`GuestRestoreRecord`], which every record names. A record of another version is refused.
 pub const VERSION: u16 = 2;
 
 /// The most bytes of a record's encoding, so that a restore packet could carry the same bytes.
@@ -189,9 +196,6 @@ pub const MAX_RECORD_BYTES: usize = 1024;
 /// The most host mappings that a configuration announces: as many as a host mapping table holds,
 /// [`MAX_HOST_MAPPINGS`].
 pub const MAX_MAPPINGS: usize = MAX_HOST_MAPPINGS;
-
-/// The longest hostname, in bytes: Linux's `HOST_NAME_MAX`, which the guest's entry applies.
-pub const MAX_HOSTNAME_BYTES: usize = 64;
 
 /// The longest proxy endpoint, in bytes.
 pub const MAX_PROXY_ENDPOINT_BYTES: usize = 255;
@@ -291,25 +295,6 @@ pub enum Upper {
     },
 }
 
-/// Whether an ext4 scratch may have a journal: the guest's assembly refuses a scratch with one
-/// when the policy [forbids](Self::Forbidden) it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Journal {
-    /// The scratch may have a journal or none.
-    Allowed,
-    /// The scratch may not have a journal.
-    Forbidden,
-}
-
-/// The overlay's mode, which selects its one option set, as the guest's assembly names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum OverlayMode {
-    /// `metacopy=on,xino=on`, for lowers whose overlay xattrs the guest trusts.
-    TrustedLowers,
-    /// `metacopy=off,redirect_dir=nofollow`, for lowers that may carry untrusted overlay xattrs.
-    UntrustedLowers,
-}
-
 /// The shape of an export.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExportKind {
@@ -349,25 +334,6 @@ pub struct Network {
     pub proxy: Option<String>,
 }
 
-/// The machine ID that the workload sees at `/etc/machine-id`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MachineIdMode {
-    /// The image's own machine ID, which the guest leaves untouched.
-    Image,
-    /// A machine ID that the guest generates for the activation.
-    Generated,
-}
-
-/// The view that a VM's workload has of it: its hostname and its machine ID, without an identity
-/// of the executions, which each execution names.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct View {
-    /// The hostname: 1 to [`MAX_HOSTNAME_BYTES`] bytes, without a NUL.
-    pub hostname: Vec<u8>,
-    /// The machine ID that the workload sees.
-    pub machine_id: MachineIdMode,
-}
-
 /// The resources that the guest must have, as a clone's repair produces them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ExpectedResources {
@@ -377,10 +343,10 @@ pub struct ExpectedResources {
     pub memory: u64,
 }
 
-/// The non-secret settings that a layered root's activation applies, as the
+/// The non-secret settings that a layered root's guest restore applies, as the
 /// [module](self#configuration) describes them.
 ///
-/// [`check`](Self::check) checks that they keep every limit, and [`ActivationRecord::new`] admits
+/// [`check`](Self::check) checks that they keep every limit, and [`GuestRestoreRecord::new`] admits
 /// only a configuration that does.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Configuration {
@@ -413,25 +379,25 @@ impl Configuration {
     /// or longer than [`MAX_PROXY_ENDPOINT_BYTES`], or holds a byte other than a visible ASCII
     /// character, or an `@`; a hostname that is empty or longer than [`MAX_HOSTNAME_BYTES`], or
     /// holds a NUL; and a CPU count or memory size of 0.
-    pub fn check(&self) -> Result<(), ActivationError> {
+    pub fn check(&self) -> Result<(), GuestRestoreError> {
         if let Image::Gpt {
             first_partition_bound: 0,
             ..
         } = self.image
         {
-            return Err(ActivationError::FirstPartitionBound);
+            return Err(GuestRestoreError::FirstPartitionBound);
         }
         if let Upper::Tmpfs { max_memory_percent } = self.upper
             && !(1..=90).contains(&max_memory_percent)
         {
-            return Err(ActivationError::TmpfsMemoryPercent(max_memory_percent));
+            return Err(GuestRestoreError::TmpfsMemoryPercent(max_memory_percent));
         }
         match (self.export.is_some(), self.mappings) {
-            (true, 0) => return Err(ActivationError::ExportWithoutMappings),
+            (true, 0) => return Err(GuestRestoreError::ExportWithoutMappings),
             (true, mappings) if mappings > MAX_MAPPINGS => {
-                return Err(ActivationError::TooManyMappings(mappings));
+                return Err(GuestRestoreError::TooManyMappings(mappings));
             }
-            (false, 1..) => return Err(ActivationError::MappingsWithoutExport),
+            (false, 1..) => return Err(GuestRestoreError::MappingsWithoutExport),
             _ => {}
         }
         if let Some(proxy) = self
@@ -440,32 +406,32 @@ impl Configuration {
             .and_then(|network| network.proxy.as_ref())
             && !is_proxy_endpoint(proxy)
         {
-            return Err(ActivationError::ProxyEndpoint);
+            return Err(GuestRestoreError::ProxyEndpoint);
         }
         if !is_hostname(&self.view.hostname) {
-            return Err(ActivationError::Hostname);
+            return Err(GuestRestoreError::Hostname);
         }
         if self.resources.cpus == 0 {
-            return Err(ActivationError::Cpus);
+            return Err(GuestRestoreError::Cpus);
         }
         if self.resources.memory == 0 {
-            return Err(ActivationError::Memory);
+            return Err(GuestRestoreError::Memory);
         }
         Ok(())
     }
 }
 
-/// An activation record: the [`VERSION`] of its schema, the [`RestoreSection`] of a clone, and
+/// A guest-restore record: the [`VERSION`] of its schema, the [`RestoreSection`] of a clone, and
 /// the [`Configuration`], which keeps every limit of the [module](self#limits).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ActivationRecord {
+pub struct GuestRestoreRecord {
     /// The restore section, for a clone.
     restore: Option<RestoreSection>,
     /// The configuration, which keeps every limit.
     configuration: Configuration,
 }
 
-impl ActivationRecord {
+impl GuestRestoreRecord {
     /// Returns the record of `configuration`, with `restore`, the restore section of a clone, or
     /// without one for a cold boot.
     ///
@@ -474,7 +440,7 @@ impl ActivationRecord {
     pub fn new(
         restore: Option<RestoreSection>,
         configuration: Configuration,
-    ) -> Result<Self, ActivationError> {
+    ) -> Result<Self, GuestRestoreError> {
         configuration.check()?;
         Ok(Self {
             restore,
@@ -498,20 +464,20 @@ impl ActivationRecord {
     }
 }
 
-/// What Ready reports about a layered root's activation: that it applied, and, for a clone, the
-/// transaction ID of the restore that it activated. Its canonical [encoding](self#ready) holds
-/// [`COLD_LEN`](Self::COLD_LEN) or [`CLONE_LEN`](Self::CLONE_LEN) bytes.
+/// What Ready reports about a layered root's guest restore: that it applied, and, for a clone,
+/// the transaction ID of the restore that it activated. Its canonical [encoding](self#ready)
+/// holds [`COLD_LEN`](Self::COLD_LEN) or [`CLONE_LEN`](Self::CLONE_LEN) bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ReadyActivation {
+pub struct GuestRestoreReady {
     /// The transaction ID of a clone's restore, or `None` for a cold boot.
     pub transaction: Option<TransactionId>,
 }
 
-/// Why an activation record, or what Ready reports about an activation, was refused: the limit or
-/// the rule that it breaks.
+/// Why a guest-restore record, or what Ready reports about a guest restore, was refused: the limit
+/// or the rule that it breaks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ActivationError {
+pub enum GuestRestoreError {
     /// A GPT disk's first-partition bound is 0.
     FirstPartitionBound,
     /// The tmpfs cap is outside 1 to 90 percent: this value.
@@ -557,7 +523,7 @@ pub enum ActivationError {
     Ready,
 }
 
-impl fmt::Display for ActivationError {
+impl fmt::Display for GuestRestoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FirstPartitionBound => {
@@ -628,13 +594,7 @@ impl fmt::Display for ActivationError {
     }
 }
 
-impl std::error::Error for ActivationError {}
-
-/// Returns whether `hostname` is a hostname that a record or a VM's [`View`] holds: 1 to
-/// [`MAX_HOSTNAME_BYTES`] bytes without a NUL, since the guest's entry sets any other.
-pub(crate) fn is_hostname(hostname: &[u8]) -> bool {
-    !hostname.is_empty() && hostname.len() <= MAX_HOSTNAME_BYTES && !hostname.contains(&0)
-}
+impl std::error::Error for GuestRestoreError {}
 
 /// Returns whether `endpoint` is a proxy endpoint that a record holds: 1 to
 /// [`MAX_PROXY_ENDPOINT_BYTES`] visible ASCII characters, without an `@`, which would start a
